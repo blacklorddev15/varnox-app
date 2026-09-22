@@ -15,11 +15,14 @@ import {
   FaTrash,
   FaExclamationCircle,
   FaFileAlt,
+  FaPhoneAlt,
 } from "react-icons/fa";
 import useUserStore from "../../store/useUserStore";
 import useChatStore from "../../store/useChatStore";
 import useLayoutStore from "../../store/useLayoutStore";
 import { getAvatarUrl } from "../../utils/avatarUtil";
+import { toast } from "react-toastify";
+import { getCallConfig, getCallCredentials } from "../../services/trtc.service";
 
 // Varnox Delivery Status Ticks
 const StatusTick = ({ status }) => {
@@ -83,6 +86,50 @@ const ChatWindow = () => {
   const [activeCategory, setActiveCategory] = useState("Smileys & People");
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 768);
   const [sending, setSending] = useState(false);
+
+  // --- Calling (TRTC) ---------------------------------------------------------------------
+  // Inert unless the SERVER reports that TRTC is configured. With no credentials the buttons
+  // never render, so the chat screen behaves exactly as it did before calls existed.
+  const [callConfig, setCallConfig] = useState({ enabled: false });
+  const [CallKit, setCallKit] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    getCallConfig().then((cfg) => {
+      if (!cancelled) setCallConfig(cfg);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const startCall = async (wantVideo) => {
+    if (!selectedContact?._id) return;
+    try {
+      // Imported on demand: the call SDK is large, and there is no reason to ship it to users
+      // who never place a call, or at all while calling is switched off server-side.
+      const trtc = await import("@trtc/calls-uikit-react");
+      const creds = await getCallCredentials();
+
+      await trtc.TUICallKitAPI.init({
+        userID: creds.userId,
+        userSig: creds.userSig,
+        SDKAppID: creds.sdkAppId,
+      });
+
+      // Mount the call overlay only once the SDK is initialised.
+      setCallKit(() => trtc.TUICallKit);
+
+      await trtc.TUICallKitAPI.calls({
+        userID: selectedContact._id,
+        type: wantVideo ? trtc.CallMediaType.VIDEO : trtc.CallMediaType.AUDIO,
+      });
+    } catch (err) {
+      // Never let a call failure take down the chat screen.
+      console.error("Could not start call:", err?.message || err);
+      toast.error(err?.message || "Could not start the call");
+    }
+  };
 
   // DOM & Timing Refs
   const typingTimeoutRef = useRef(null);
@@ -271,6 +318,9 @@ const ChatWindow = () => {
 
   return (
     <div className="h-full flex flex-col bg-[#efeae2] dark:bg-[#0b141a] transition-colors relative">
+      {/* TRTC renders its call overlay as a fixed-position element, so its DOM position is irrelevant. */}
+      {CallKit && <CallKit />}
+
       {/* 1. Header Bar */}
       <div className="h-16 px-4 bg-[#f0f2f5] dark:bg-[#202c33] border-b border-[#e9edef] dark:border-[#222e35] flex items-center justify-between flex-shrink-0 z-20 select-none">
         <div className="flex items-center gap-3">
@@ -317,6 +367,27 @@ const ChatWindow = () => {
         </div>
 
         <div className="flex items-center gap-1 text-[#54656f] dark:text-[#aebac1]">
+          {/* Rendered only when the server reports TRTC is configured. */}
+          {callConfig.enabled && (
+            <>
+              <button
+                onClick={() => startCall(true)}
+                title="Video call"
+                aria-label="Video call"
+                className="p-2 rounded-full hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+              >
+                <FaVideo className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => startCall(false)}
+                title="Voice call"
+                aria-label="Voice call"
+                className="p-2 rounded-full hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+              >
+                <FaPhoneAlt className="w-4 h-4" />
+              </button>
+            </>
+          )}
           <button className="p-2 rounded-full hover:bg-black/5 dark:hover:bg-white/5 transition-colors">
             <FaEllipsisV className="w-4 h-4" />
           </button>

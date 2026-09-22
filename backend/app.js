@@ -10,6 +10,7 @@ const connectDB = require("./config/dbConnect");
 const authRoute = require("./routes/authRoute");
 const chatRoute = require("./routes/chatRoute");
 const statusRoute = require("./routes/statusRoute");
+const trtcRoute = require("./routes/trtcRoute");
 const { initializeSocket } = require("./services/socketService");
 require("./services/firebaseService");
 
@@ -55,6 +56,7 @@ app.get("/api/health", (req, res) =>
     service: "varnox-api",
     mongoConfigured: Boolean(process.env.MONGO_URI),
     cloudinaryConfigured: Boolean(process.env.CLOUDINARY_CLOUD_NAME),
+    trtcConfigured: Boolean(process.env.TRTC_SDK_APP_ID && process.env.TRTC_SDK_SECRET_KEY),
     emailProvider: process.env.RESEND_API_KEY ? "resend" : "gmail-smtp",
     ts: Date.now(),
   })
@@ -88,6 +90,7 @@ app.use("/api/auth", authRoute);
 app.use("/api/chat", chatRoute);
 app.use("/api/chats", chatRoute);
 app.use("/api/status", statusRoute);
+app.use("/api/trtc", trtcRoute);
 
 // Nothing above may call server.listen(): on Vercel the platform owns the listener and drives
 // the exported server. `index.js` attaches the listener for local development only.
