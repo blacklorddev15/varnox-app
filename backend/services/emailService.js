@@ -39,7 +39,18 @@ if (useResend) {
 }
 
 // The From address. With Resend this must sit on a domain you have verified.
-const FROM_ADDRESS = process.env.RESEND_FROM || process.env.EMAIL;
+//
+// Accepts EITHER a bare address (no-reply@example.com) OR an already-decorated
+// "Name <addr>" value. Without this check a decorated value (which is how RESEND_FROM is
+// stored in the Vercel project) produced a malformed header:
+//   from: "Varnox App" <Varnox Chat <no-reply@varnoxapp.blacklord.tech>>
+// Resend rejects that, so every OTP send would have failed with an opaque error.
+const FROM_RAW = process.env.RESEND_FROM || process.env.EMAIL;
+const FROM_HEADER = FROM_RAW
+  ? FROM_RAW.includes("<")
+    ? FROM_RAW
+    : `"Varnox App" <${FROM_RAW}>`
+  : null;
 
 const sendOtpToEmail = async (email, otp) => {
   const digits = String(otp).split("");
@@ -208,7 +219,7 @@ const sendOtpToEmail = async (email, otp) => {
 
   if (useResend) {
     const { error } = await resend.emails.send({
-      from: `"Varnox App" <${FROM_ADDRESS}>`,
+      from: FROM_HEADER,
       to: email,
       subject,
       html,
@@ -217,7 +228,7 @@ const sendOtpToEmail = async (email, otp) => {
     if (error) throw new Error(error.message || "Resend rejected the message");
   } else {
     await smtpTransporter.sendMail({
-      from: `"Varnox App" <${FROM_ADDRESS}>`,
+      from: FROM_HEADER,
       to: email,
       subject,
       html,
