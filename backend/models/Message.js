@@ -25,7 +25,27 @@ const messageSchema = new mongoose.Schema(
     },
     contentType: {
         type: String,
-        enum: ["text", "image", "video"],   
+        // "file" covers any non-media attachment (pdf, docx, zip, …) and is rendered as a file
+        // card rather than a preview.
+        enum: ["text", "image", "video", "file"],
+    },
+    // Original name/size/type of an attachment. Without this a file card would only be able to
+    // show a Cloudinary URL, which tells the recipient nothing.
+    fileMeta: {
+      name: { type: String },
+      size: { type: Number },
+      mimeType: { type: String },
+    },
+    // Quote / reply. Refers to another Message; may dangle if that message is later deleted,
+    // so the UI has to tolerate a null populate.
+    replyTo: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Message",
+    },
+    // Shown as a "Forwarded" label, following WhatsApp convention.
+    isForwarded: {
+      type: Boolean,
+      default: false,
     },
     reactions: [{
         user: {
@@ -45,6 +65,11 @@ const messageSchema = new mongoose.Schema(
     { timestamps: true }
 
 );
+
+// Both fetching a conversation's history and searching it filter on `conversation`, then order by
+// time — so a compound index serves both. (A Mongo text index was the obvious alternative, but it
+// matches whole words only, and chat search needs substring matching.)
+messageSchema.index({ conversation: 1, createdAt: -1 });
 
 const Message = mongoose.model("Message", messageSchema);
 module.exports = Message;

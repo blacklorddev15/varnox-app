@@ -5,7 +5,7 @@ const response = require("../utils/responseHandler");
 
 exports.sendMessage = async (req, res) => {
   try {
-    const { senderId, receiverId, content, messageStatus } = req.body;
+    const { senderId, receiverId, content, messageStatus, replyToId, isForwarded } = req.body;
     const effectiveSenderId = senderId || req.user?._id;
     const file = req.file;
 
@@ -28,6 +28,7 @@ exports.sendMessage = async (req, res) => {
 
     let imageOrVideoUrl = null;
     let contentType = "text";
+    let fileMeta;
 
     if (file) {
       const uploadResult = await uploadOnCloudinary(file);
@@ -41,10 +42,33 @@ exports.sendMessage = async (req, res) => {
       } else if (file.mimetype?.startsWith("video/")) {
         contentType = "video";
       } else {
-        return response(res, 400, "Invalid file type. Only images and videos are allowed.");
+        // Anything else is accepted as a generic attachment and shown as a file card. The old
+        // code rejected every non image/video type outright.
+        contentType = "file";
       }
+
+      fileMeta = {
+        name: file.originalname || null,
+        size: file.size || null,
+        mimeType: file.mimetype || null,
+      };
     } else if (!content?.trim()) {
       return response(res, 400, "Message content or file is required");
+    }
+
+    // A reply must point at a message in THIS conversation. Without that check a crafted request
+    // could quote a message from someone else's private chat.
+    let replyTo = null;
+    if (replyToId) {
+      const quoted = await Message.findOne({
+        _id: replyToId,
+        conversation: conversation._id,
+      }).select("_id");
+
+      if (!quoted) {
+        return response(res, 400, "The message being replied to is not in this conversation");
+      }
+      replyTo = quoted._id;
     }
 
     const message = new Message({
@@ -54,6 +78,9 @@ exports.sendMessage = async (req, res) => {
       content: content || null,
       contentType: contentType,
       imageOrVideoUrl: imageOrVideoUrl,
+      fileMeta,
+      replyTo,
+      isForwarded: isForwarded === true || isForwarded === "true",
       messageStatus: messageStatus || "sent",
     });
     await message.save();
@@ -64,7 +91,14 @@ exports.sendMessage = async (req, res) => {
 
     const populatedMessage = await Message.findById(message._id)
       .populate("sender", "username profilePicture")
-      .populate("receiver", "username profilePicture");
+      .populate("receiver", "username profilePicture")
+      // Include just enough of the quoted message to render a preview. A deleted original simply
+      // populates to null, which the UI has to tolerate.
+      .populate({
+        path: "replyTo",
+        select: "content contentType imageOrVideoUrl fileMeta sender",
+        populate: { path: "sender", select: "username" },
+      });
 
     if (req.io && req.socketUserMap) {
       const receiverSocketId = req.socketUserMap.get(receiverId?.toString());
@@ -121,6 +155,11 @@ exports.getMessages = async (req, res) => {
       .populate("sender", "username profilePicture")
       .populate("receiver", "username profilePicture")
       .populate("reactions.user", "username profilePicture")
+      .populate({
+        path: "replyTo",
+        select: "content contentType imageOrVideoUrl fileMeta sender",
+        populate: { path: "sender", select: "username" },
+      })
       .sort({ createdAt: 1 });
 
     await Message.updateMany(
@@ -322,5 +361,117 @@ exports.deleteConversation = async (req, res) => {
   } catch (error) {
     console.error("Error deleting conversation:", error);
     return response(res, 500, "Failed to delete conversation", { error: error.message });
+  }
+};
+
+exports.searchMessages = async (req, res) => {
+  const userId = req.user?._id || req.user?.userId;
+  const rawQuery = (req.query.q || "").trim();
+
+  if (!rawQuery) {
+    return response(res, 400, "A search query is required");
+  }
+
+  try {
+    const conversations = await Conversation.find({ participants: userId }).select("_id");
+    const conversationIds = conversations.map((c) => c._id);
+
+    // Escape regex metacharacters so a query like "a+b" is matched literally. Unescaped, it would
+    // be interpreted as a pattern — potentially expensive, and matching things the user never asked
+    // for.
+    const safe = rawQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    const messages = await Message.find({
+      // Scoped to the caller's own conversations. Without this filter, search would be a way to
+      // read other people's messages.
+      conversation: { $in: conversationIds },
+      content: { $regex: safe, $options: "i" },
+    })
+      .populate("sender", "username profilePicture")
+      .populate("receiver", "username profilePicture")
+      .sort({ createdAt: -1 })
+      .limit(60);
+
+    return response(res, 200, "Search complete", {
+      query: rawQuery,
+      count: messages.length,
+      messages,
+    });
+  } catch (error) {
+    console.error("Error searching messages:", error);
+    return response(res, 500, "Failed to search messages", { error: error.message });
+  }
+};
+
+exports.forwardMessage = async (req, res) => {
+  const userId = req.user?._id || req.user?.userId;
+  const { messageId, receiverId } = req.body;
+
+  try {
+    if (!messageId || !receiverId) {
+      return response(res, 400, "messageId and receiverId are required");
+    }
+
+    const source = await Message.findById(messageId);
+    if (!source) {
+      return response(res, 404, "Message not found");
+    }
+
+    // The source must come from a conversation the caller is in — otherwise forwarding would
+    // double as a way to read a message you were never party to.
+    const sourceConversation = await Conversation.findById(source.conversation);
+    const isParticipant = sourceConversation?.participants
+      .map((p) => p.toString())
+      .includes(userId.toString());
+
+    if (!isParticipant) {
+      return response(res, 403, "You can only forward messages from your own conversations");
+    }
+
+    let conversation = await Conversation.findOne({
+      participants: { $all: [userId, receiverId] },
+    });
+
+    if (!conversation) {
+      conversation = await Conversation.create({
+        participants: [userId, receiverId],
+        lastMessage: null,
+        unreadCount: 0,
+      });
+    }
+
+    const forwarded = await Message.create({
+      conversation: conversation._id,
+      sender: userId,
+      receiver: receiverId,
+      content: source.content || null,
+      contentType: source.contentType,
+      imageOrVideoUrl: source.imageOrVideoUrl || null,
+      fileMeta: source.fileMeta || undefined,
+      isForwarded: true,
+      messageStatus: "sent",
+    });
+
+    conversation.lastMessage = forwarded._id;
+    conversation.unreadCount += 1;
+    await conversation.save();
+
+    const populated = await Message.findById(forwarded._id)
+      .populate("sender", "username profilePicture")
+      .populate("receiver", "username profilePicture");
+
+    if (req.io && req.socketUserMap) {
+      const receiverSocketId = req.socketUserMap.get(receiverId?.toString());
+      if (receiverSocketId) {
+        req.io.to(receiverSocketId).emit("receiveMessage", populated);
+        forwarded.messageStatus = "delivered";
+        await forwarded.save();
+      }
+    }
+
+    return response(res, 201, "Message forwarded successfully", populated);
+  } catch (error) {
+    console.error("Error forwarding message:", error);
+    return response(res, 500, "Failed to forward message", { error: error.message });
   }
 };

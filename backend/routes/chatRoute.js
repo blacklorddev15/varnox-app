@@ -20,4 +20,8 @@ router.delete("/delete-message/:messageId", authMiddleware, chatController.delet
 router.put("/update-message/:messageId", authMiddleware, multerMiddleware, chatController.updateMessage);
 router.delete("/delete-conversation/:conversationId", authMiddleware, chatController.deleteConversation);
 
+// Search across the caller's own conversations, and forward a message to another user.
+router.get("/search", authMiddleware, chatController.searchMessages);
+router.post("/forward", authMiddleware, chatController.forwardMessage);
+
 module.exports = router; 
