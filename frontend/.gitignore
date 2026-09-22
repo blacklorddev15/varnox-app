@@ -26,3 +26,6 @@ yarn-debug.log*
 yarn-error.log*
 .vercel
 .env*
+
+# Generated OTA bundles (scripts/make-bundle.mjs). Rebuilt on every release; not source.
+public/bundles/

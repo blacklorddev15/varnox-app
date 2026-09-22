@@ -1,4 +1,4 @@
-import React, { useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import Layout from "./Layout";
 import ChatList from "./ChatList";
 import useLayoutStore from "../store/useLayoutStore";
@@ -6,6 +6,12 @@ import useUserStore from "../store/useUserStore";
 import useThemeStore from "../store/useThemeStore";
 import { getAvatarUrl } from "../utils/avatarUtil";
 import { updateUserProfile } from "../services/userService";
+import {
+  applyUpdate,
+  openApkDownload,
+  currentBundleVersion,
+  isNativeApp,
+} from "../services/updater.service";
 import { toast } from "react-toastify";
 import {
   FaArrowLeft,
@@ -20,6 +26,8 @@ import {
   FaPalette,
   FaQuestionCircle,
   FaPlus,
+  FaSyncAlt,
+  FaDownload,
   FaCircleNotch,
   FaPhoneAlt,
   FaEnvelope,
@@ -42,6 +50,37 @@ const HomePage = () => {
   const [isEditingAbout, setIsEditingAbout] = useState(false);
   const [aboutInput, setAboutInput] = useState("");
   const [savingAbout, setSavingAbout] = useState(false);
+
+  // --- App updates (OTA) ---------------------------------------------------------------------
+  const [bundleVersion, setBundleVersion] = useState(null);
+  const [updating, setUpdating] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState(0);
+
+  useEffect(() => {
+    if (!isNativeApp()) return;
+    currentBundleVersion().then(setBundleVersion);
+  }, []);
+
+  const handleGoUpdate = async () => {
+    if (updating) return;
+    setUpdating(true);
+    setUpdateProgress(0);
+
+    try {
+      // Native: downloads and applies a new web bundle, then reloads.
+      // Browser: a cache-bypassing reload, so the button still does something useful in testing.
+      const result = await applyUpdate(setUpdateProgress);
+
+      if (result?.updated === false) {
+        toast.success("You are already on the latest version");
+        setUpdating(false);
+      }
+      // After a successful native update the app reloads, so no state reset is needed here.
+    } catch (err) {
+      toast.error(err?.message || "Update failed. Please try again.");
+      setUpdating(false);
+    }
+  };
   const aboutInputRef = useRef(null);
 
   const handleStartEditName = () => {
@@ -306,6 +345,47 @@ const HomePage = () => {
                   <p className="font-medium">Help & About</p>
                   <span className="text-xs text-[#8696a0]">FAQ, contact us</span>
                 </div>
+              </div>
+
+              {/* --- App updates -------------------------------------------------------- */}
+              <div className="mt-2 pt-2 border-t border-[#e9edef] dark:border-[#222e35]">
+                <p className="px-5 pt-2 pb-1 text-xs uppercase tracking-wider text-[#00a884] font-semibold">
+                  App updates
+                </p>
+                <p className="px-5 pb-2 text-xs text-[#8696a0]">
+                  {bundleVersion ? `Installed version ${bundleVersion}` : "Web version"}
+                </p>
+
+                <button
+                  onClick={handleGoUpdate}
+                  disabled={updating}
+                  className="w-full flex items-center gap-4 px-5 py-3.5 text-left text-[#111b21] dark:text-[#e9edef] hover:bg-black/5 dark:hover:bg-white/5 transition-colors disabled:opacity-60"
+                >
+                  <FaSyncAlt
+                    className={`w-5 h-5 text-[#00a884] ${updating ? "animate-spin" : ""}`}
+                  />
+                  <div className="text-left">
+                    <p className="font-medium">{updating ? "Updating…" : "Go Update"}</p>
+                    <span className="text-xs text-[#8696a0]">
+                      {updating
+                        ? `Downloading ${updateProgress}%`
+                        : "Install the latest version without reinstalling"}
+                    </span>
+                  </div>
+                </button>
+
+                <button
+                  onClick={openApkDownload}
+                  className="w-full flex items-center gap-4 px-5 py-3.5 text-left text-[#111b21] dark:text-[#e9edef] hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+                >
+                  <FaDownload className="w-5 h-5 text-[#00a884]" />
+                  <div className="text-left">
+                    <p className="font-medium">Download app</p>
+                    <span className="text-xs text-[#8696a0]">
+                      Get the full APK — for a first install or a clean start
+                    </span>
+                  </div>
+                </button>
               </div>
             </div>
           </div>
