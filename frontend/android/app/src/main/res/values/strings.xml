@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Varnox App</string>
+    <string name="title_activity_main">Varnox App</string>
+    <string name="package_name">tech.blacklord.varnox</string>
+    <string name="custom_url_scheme">tech.blacklord.varnox</string>
+</resources>

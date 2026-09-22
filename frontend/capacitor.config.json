@@ -1,0 +1,12 @@
+{
+  "appId": "tech.blacklord.varnox",
+  "appName": "Varnox App",
+  "webDir": "dist",
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#030303"
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}
