@@ -2,11 +2,9 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import './index.css';
 import App from './App';
-import { notifyAppReady } from './services/updater.service';
 
-// Mandatory for OTA updates: until this is called, the updater treats the running bundle as
-// unverified and rolls back to the previous one. Fire-and-forget, and a no-op on the web.
-notifyAppReady();
+// notifyAppReady() lives in App.jsx, deliberately AFTER the tree mounts: calling it here would
+// confirm the bundle as good even if React then failed to render, defeating the rollback.
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(

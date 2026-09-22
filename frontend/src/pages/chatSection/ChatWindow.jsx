@@ -16,13 +16,16 @@ import {
   FaExclamationCircle,
   FaFileAlt,
   FaPhoneAlt,
+  FaReply,
+  FaShare,
 } from "react-icons/fa";
 import useUserStore from "../../store/useUserStore";
 import useChatStore from "../../store/useChatStore";
 import useLayoutStore from "../../store/useLayoutStore";
 import { getAvatarUrl } from "../../utils/avatarUtil";
 import { toast } from "react-toastify";
-import { getCallConfig, getCallCredentials } from "../../services/trtc.service";
+import { getCallConfig, ensureCallInit } from "../../services/trtc.service";
+import { forwardMessage as forwardMessageApi } from "../../services/chat.api";
 
 // Varnox Delivery Status Ticks
 const StatusTick = ({ status }) => {
@@ -87,11 +90,15 @@ const ChatWindow = () => {
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 768);
   const [sending, setSending] = useState(false);
 
+  // --- Reply / forward -----------------------------------------------------------------------
+  const [replyingTo, setReplyingTo] = useState(null);
+  const [forwardingMsg, setForwardingMsg] = useState(null);
+  const [forwarding, setForwarding] = useState(false);
+
   // --- Calling (TRTC) ---------------------------------------------------------------------
   // Inert unless the SERVER reports that TRTC is configured. With no credentials the buttons
   // never render, so the chat screen behaves exactly as it did before calls existed.
   const [callConfig, setCallConfig] = useState({ enabled: false });
-  const [CallKit, setCallKit] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -106,19 +113,10 @@ const ChatWindow = () => {
   const startCall = async (wantVideo) => {
     if (!selectedContact?._id) return;
     try {
-      // Imported on demand: the call SDK is large, and there is no reason to ship it to users
-      // who never place a call, or at all while calling is switched off server-side.
-      const trtc = await import("@trtc/calls-uikit-react");
-      const creds = await getCallCredentials();
-
-      await trtc.TUICallKitAPI.init({
-        userID: creds.userId,
-        userSig: creds.userSig,
-        SDKAppID: creds.sdkAppId,
-      });
-
-      // Mount the call overlay only once the SDK is initialised.
-      setCallKit(() => trtc.TUICallKit);
+      // Init already happened at app level (App.jsx), which is what makes receiving calls
+      // possible at all. ensureCallInit returns the cached instance, or performs the init if this
+      // runs before that effect — so placing a call works either way.
+      const trtc = await ensureCallInit();
 
       await trtc.TUICallKitAPI.calls({
         userID: selectedContact._id,
@@ -263,9 +261,16 @@ const ChatWindow = () => {
       formData.append("file", selectedFile);
     }
 
+    // Quote / reply. The server independently verifies the target message belongs to this
+    // conversation, so a tampered request cannot quote from someone else's chat.
+    if (replyingTo?._id) {
+      formData.append("replyToId", replyingTo._id);
+    }
+
     // Flush local inputs immediately
     setMessage("");
     clearFile();
+    setReplyingTo(null);
     setShowEmojiPicker(false);
     setShowFileMenu(false);
 
@@ -276,6 +281,34 @@ const ChatWindow = () => {
       console.error("Failed to send message:", err);
     } finally {
       setSending(false);
+    }
+  };
+
+  const handleForward = async (conversation) => {
+    if (!forwardingMsg || !conversation) return;
+
+    // Conversations are pairwise, so the target is whichever participant is not the current user.
+    // Tolerates participants being either populated objects or raw ids.
+    const other = conversation.participants?.find(
+      (p) => (p._id || p).toString() !== currentUser?._id?.toString()
+    );
+    const receiverId = other?._id || other;
+
+    if (!receiverId) {
+      toast.error("Could not work out who to forward to");
+      return;
+    }
+
+    setForwarding(true);
+    try {
+      await forwardMessageApi({ messageId: forwardingMsg._id, receiverId });
+      toast.success("Message forwarded");
+      setForwardingMsg(null);
+      fetchConversations();
+    } catch (err) {
+      toast.error(err?.message || "Could not forward the message");
+    } finally {
+      setForwarding(false);
     }
   };
 
@@ -318,8 +351,8 @@ const ChatWindow = () => {
 
   return (
     <div className="h-full flex flex-col bg-[#efeae2] dark:bg-[#0b141a] transition-colors relative">
-      {/* TRTC renders its call overlay as a fixed-position element, so its DOM position is irrelevant. */}
-      {CallKit && <CallKit />}
+      {/* The call overlay is mounted at the app root (App.jsx) so an incoming call can appear
+          over any screen, not only an open chat. */}
 
       {/* 1. Header Bar */}
       <div className="h-16 px-4 bg-[#f0f2f5] dark:bg-[#202c33] border-b border-[#e9edef] dark:border-[#222e35] flex items-center justify-between flex-shrink-0 z-20 select-none">
@@ -434,8 +467,64 @@ const ChatWindow = () => {
                           : "bg-white dark:bg-[#202c33] rounded-tl-none"
                       }`}
                     >
-                      {/* Media Image / Video Attachment */}
-                      {msg.imageOrVideoUrl && (
+                      {/* Forwarded badge */}
+                      {msg.isForwarded && (
+                        <div className="flex items-center gap-1 mb-1 text-[11px] italic text-[#8696a0]">
+                          <FaShare className="w-3 h-3" />
+                          Forwarded
+                        </div>
+                      )}
+
+                      {/* Quoted message. Tolerates a null replyTo — the original may have been
+                          deleted — and falls back to a label for non-text messages. */}
+                      {msg.replyTo && (
+                        <div
+                          className={`mb-1.5 rounded-md border-l-4 px-2 py-1 ${
+                            isMine
+                              ? "border-[#06cf9c] bg-black/5 dark:bg-black/20"
+                              : "border-[#00a884] bg-black/5 dark:bg-black/20"
+                          }`}
+                        >
+                          <p className="text-[11px] font-medium text-[#00a884]">
+                            {msg.replyTo.sender?.username || "Message"}
+                          </p>
+                          <p className="text-[12px] truncate text-[#667781] dark:text-[#8696a0]">
+                            {msg.replyTo.content ||
+                              (msg.replyTo.contentType === "image"
+                                ? "Photo"
+                                : msg.replyTo.contentType === "video"
+                                  ? "Video"
+                                  : msg.replyTo.contentType === "file"
+                                    ? msg.replyTo.fileMeta?.name || "Document"
+                                    : "Message unavailable")}
+                          </p>
+                        </div>
+                      )}
+
+                      {/* Generic file attachment — a card with name/size, never a broken image. */}
+                      {msg.contentType === "file" && msg.imageOrVideoUrl && (
+                        <a
+                          href={msg.imageOrVideoUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="mb-1.5 flex items-center gap-2.5 rounded-md bg-black/5 px-2.5 py-2 transition-colors hover:bg-black/10 dark:bg-black/20 dark:hover:bg-black/30"
+                        >
+                          <FaFileAlt className="w-6 h-6 shrink-0 text-[#00a884]" />
+                          <span className="min-w-0">
+                            <span className="block truncate text-[12.5px] text-[#111b21] dark:text-[#e9edef]">
+                              {msg.fileMeta?.name || "Attachment"}
+                            </span>
+                            {msg.fileMeta?.size ? (
+                              <span className="block text-[11px] text-[#8696a0]">
+                                {(msg.fileMeta.size / 1024).toFixed(1)} KB · tap to download
+                              </span>
+                            ) : null}
+                          </span>
+                        </a>
+                      )}
+
+                      {/* Media Image / Video Attachment (file cards render above instead) */}
+                      {msg.imageOrVideoUrl && msg.contentType !== "file" && (
                         <div className="mb-1.5 overflow-hidden rounded-md">
                           {msg.contentType === "video" ? (
                             <video
@@ -495,6 +584,23 @@ const ChatWindow = () => {
                             {emoji}
                           </button>
                         ))}
+
+                        <button
+                          onClick={() => setReplyingTo(msg)}
+                          className="p-1 text-[#8696a0] hover:text-[#00a884] transition-colors"
+                          title="Reply"
+                        >
+                          <FaReply className="w-2.5 h-2.5" />
+                        </button>
+
+                        <button
+                          onClick={() => setForwardingMsg(msg)}
+                          className="p-1 text-[#8696a0] hover:text-[#00a884] transition-colors"
+                          title="Forward"
+                        >
+                          <FaShare className="w-2.5 h-2.5" />
+                        </button>
+
                         {isMine && (
                           <button
                             onClick={() => deleteMessage(msg._id)}
@@ -616,14 +722,102 @@ const ChatWindow = () => {
         </div>
       )}
 
-      {/* Hidden File Input */}
+      {/* Hidden File Input.
+          No `accept` filter any more: arbitrary documents are supported and render as file cards. */}
       <input
         ref={fileInputRef}
         type="file"
-        accept="image/*,video/*"
         onChange={handleFileChange}
         className="hidden"
       />
+
+      {/* Reply preview — shown while composing a reply. */}
+      {replyingTo && (
+        <div className="px-3 py-2 bg-[#f0f2f5] dark:bg-[#202c33] border-t border-[#e9edef] dark:border-[#222e35] flex items-center gap-3 z-20">
+          <div className="flex-1 min-w-0 border-l-4 border-[#00a884] bg-black/5 dark:bg-black/20 rounded-md px-2.5 py-1.5">
+            <p className="text-[11px] font-medium text-[#00a884]">
+              Replying to {replyingTo.sender?.username || "message"}
+            </p>
+            <p className="text-[12px] truncate text-[#667781] dark:text-[#8696a0]">
+              {replyingTo.content ||
+                (replyingTo.contentType === "image"
+                  ? "Photo"
+                  : replyingTo.contentType === "video"
+                    ? "Video"
+                    : replyingTo.contentType === "file"
+                      ? replyingTo.fileMeta?.name || "Document"
+                      : "Message")}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setReplyingTo(null)}
+            className="p-2 rounded-full hover:bg-black/10 dark:hover:bg-white/10 text-[#8696a0] hover:text-[#111b21] dark:hover:text-white"
+            title="Cancel reply"
+          >
+            <FaTimes className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* Forward picker. Conversations are pairwise, so each row is one contact. */}
+      {forwardingMsg && (
+        <div className="absolute inset-0 z-40 bg-black/50 flex items-center justify-center p-4">
+          <div className="w-full max-w-sm rounded-xl bg-white dark:bg-[#111b21] shadow-xl overflow-hidden">
+            <div className="px-4 py-3 border-b border-[#e9edef] dark:border-[#222e35] flex items-center justify-between">
+              <p className="font-medium text-[#111b21] dark:text-[#e9edef]">Forward to…</p>
+              <button
+                type="button"
+                onClick={() => setForwardingMsg(null)}
+                className="p-1.5 rounded-full text-[#8696a0] hover:bg-black/10 dark:hover:bg-white/10"
+                title="Cancel"
+              >
+                <FaTimes className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="max-h-72 overflow-y-auto">
+              {conversations?.length ? (
+                conversations.map((c) => {
+                  const other = c.participants?.find(
+                    (p) => (p._id || p).toString() !== currentUser?._id?.toString()
+                  );
+                  const name = other?.username || "Unknown contact";
+
+                  return (
+                    <button
+                      key={c._id}
+                      type="button"
+                      disabled={forwarding}
+                      onClick={() => handleForward(c)}
+                      className="w-full flex items-center gap-3 px-4 py-2.5 text-left hover:bg-black/5 dark:hover:bg-white/5 disabled:opacity-50"
+                    >
+                      {other?.profilePicture ? (
+                        <img
+                          src={getAvatarUrl(other.profilePicture)}
+                          alt=""
+                          className="w-9 h-9 rounded-full object-cover"
+                        />
+                      ) : (
+                        <span className="w-9 h-9 rounded-full bg-[#00a884]/15 text-[#00a884] flex items-center justify-center text-sm font-medium">
+                          {name.charAt(0).toUpperCase()}
+                        </span>
+                      )}
+                      <span className="text-[14px] text-[#111b21] dark:text-[#e9edef] truncate">
+                        {name}
+                      </span>
+                    </button>
+                  );
+                })
+              ) : (
+                <p className="px-4 py-6 text-center text-sm text-[#8696a0]">
+                  No conversations to forward to yet
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 6. Footer Input Bar */}
       <form

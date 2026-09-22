@@ -38,3 +38,46 @@ export const getCallCredentials = async () => {
 
   return data;
 };
+
+/**
+ * Initialise TUICallKit once per session, as soon as we know who the user is.
+ *
+ * This must NOT wait until the user places a call. Until init() has run the client is not
+ * registered with TRTC, so the app cannot RECEIVE an incoming call — the caller would ring into
+ * the void and the callee would never see anything. Placing a call worked before without this;
+ * being called did not.
+ *
+ * The promise is cached so React re-renders and multiple callers share a single init.
+ */
+let initPromise = null;
+
+export const ensureCallInit = () => {
+  if (initPromise) return initPromise;
+
+  initPromise = (async () => {
+    const config = await getCallConfig();
+    if (!config.enabled) {
+      throw new Error("Calling is not configured on this server");
+    }
+
+    // Imported dynamically so the ~3.4 MB SDK stays out of the main bundle entirely when calling
+    // is switched off.
+    const trtc = await import("@trtc/calls-uikit-react");
+    const creds = await getCallCredentials();
+
+    await trtc.TUICallKitAPI.init({
+      userID: creds.userId,
+      userSig: creds.userSig,
+      SDKAppID: creds.sdkAppId,
+    });
+
+    return trtc;
+  })();
+
+  // Allow a retry: without this, one transient failure would poison the cache for the whole session.
+  initPromise.catch(() => {
+    initPromise = null;
+  });
+
+  return initPromise;
+};

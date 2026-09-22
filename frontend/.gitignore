@@ -29,3 +29,8 @@ yarn-error.log*
 
 # Generated OTA bundles (scripts/make-bundle.mjs). Rebuilt on every release; not source.
 public/bundles/
+
+# The sideloadable APK is a BUILD ARTIFACT, served by the web deployment at /varnox-app.apk.
+# Deliberately not tracked: each 13 MB revision would live in git history forever.
+# Copy it into public/ (and dist/) at deploy time — see scripts/make-bundle.mjs notes.
+public/*.apk

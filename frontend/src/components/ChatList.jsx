@@ -15,6 +15,7 @@ import useUserStore from "../store/useUserStore";
 import useLayoutStore from "../store/useLayoutStore";
 import useChatStore from "../store/useChatStore";
 import { getAllUsers } from "../services/userService";
+import { searchMessages } from "../services/chat.api";
 import { getAvatarUrl } from "../utils/avatarUtil";
 
 const ChatList = () => {
@@ -27,6 +28,41 @@ const ChatList = () => {
   const [searchQuery, setSearchQuery] = useState("");
   const [filterType, setFilterType] = useState("all"); // 'all' | 'unread' | 'groups'
   const [showMenu, setShowMenu] = useState(false);
+
+  // Message-body search results, shown alongside the contact filter.
+  const [messageResults, setMessageResults] = useState([]);
+  const [searchingMessages, setSearchingMessages] = useState(false);
+
+  // Debounced, and only from 3 characters — the contact filter is instant and local, but this one
+  // hits the API, so firing on every keystroke would be wasteful.
+  useEffect(() => {
+    const q = searchQuery.trim();
+
+    if (q.length < 3) {
+      setMessageResults([]);
+      setSearchingMessages(false);
+      return;
+    }
+
+    let cancelled = false;
+
+    const timer = setTimeout(async () => {
+      try {
+        setSearchingMessages(true);
+        const res = await searchMessages(q);
+        if (!cancelled) setMessageResults(res?.data?.messages || []);
+      } catch {
+        if (!cancelled) setMessageResults([]);
+      } finally {
+        if (!cancelled) setSearchingMessages(false);
+      }
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [searchQuery]);
 
   useEffect(() => {
     const fetchUsers = async () => {
@@ -181,6 +217,59 @@ const ChatList = () => {
           </button>
         </div>
       </div>
+
+      {/* Message-body matches, above the contact list, so a query finds both people and things
+          that were said. */}
+      {searchQuery.trim().length >= 3 && (searchingMessages || messageResults.length > 0) && (
+        <div className="border-b border-[#e9edef] dark:border-[#222e35] max-h-56 overflow-y-auto">
+          <p className="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wider text-[#00a884] font-semibold">
+            Messages
+          </p>
+
+          {searchingMessages && messageResults.length === 0 ? (
+            <p className="px-3 pb-2 text-[11px] text-[#8696a0]">Searching…</p>
+          ) : (
+            messageResults.map((m) => {
+              const isMine = m.sender?._id?.toString() === currentUser?._id?.toString();
+              const other = (isMine ? m.receiver : m.sender) || {};
+              const name = other.username || "Unknown contact";
+
+              return (
+                <button
+                  key={m._id}
+                  onClick={() => {
+                    setSelectedContact({
+                      _id: other._id,
+                      username: other.username,
+                      profilePicture: other.profilePicture,
+                    });
+                    setSearchQuery("");
+                  }}
+                  className="w-full flex items-start gap-2.5 px-3 py-2 text-left hover:bg-black/5 dark:hover:bg-white/5"
+                >
+                  {other.profilePicture ? (
+                    <img
+                      src={getAvatarUrl(other.profilePicture)}
+                      alt=""
+                      className="w-8 h-8 rounded-full object-cover flex-shrink-0"
+                    />
+                  ) : (
+                    <span className="w-8 h-8 rounded-full bg-[#00a884]/15 text-[#00a884] flex items-center justify-center text-xs font-medium flex-shrink-0">
+                      {name.charAt(0).toUpperCase()}
+                    </span>
+                  )}
+                  <span className="min-w-0">
+                    <span className="block text-[12.5px] text-[#111b21] dark:text-[#e9edef]">
+                      {name}
+                    </span>
+                    <span className="block text-[11px] truncate text-[#8696a0]">{m.content}</span>
+                  </span>
+                </button>
+              );
+            })
+          )}
+        </div>
+      )}
 
       <div className="flex-1 overflow-y-auto divide-y divide-[#e9edef]/60 dark:divide-[#222e35]/60">
         {loading ? (

@@ -60,3 +60,16 @@ export const deleteConversation = async (conversationId) => {
   const res = await axiosInstance.delete(`/chat/delete-conversation/${conversationId}`);
   return res.data;
 };
+
+// Forward an existing message to another user. The server checks the source message really
+// belongs to a conversation you are part of, so this cannot be used to read other people's chats.
+export const forwardMessage = async ({ messageId, receiverId }) => {
+  const res = await axiosInstance.post("/chat/forward", { messageId, receiverId });
+  return res.data;
+};
+
+// Substring search across the caller's own messages. Returns { count, messages }.
+export const searchMessages = async (query) => {
+  const res = await axiosInstance.get("/chat/search", { params: { q: query } });
+  return res.data;
+};
