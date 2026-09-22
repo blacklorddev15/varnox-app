@@ -167,9 +167,13 @@ exports.sendMessage = async (req, res) => {
     // a crafted request cannot mention somebody outside the group.
     let mentions = [];
 
-    if (conversation.isGroup && Array.isArray(mentionedIds)) {
+    if (conversation.isGroup && mentionedIds) {
+      // Multipart bodies only turn repeated fields into an array from the SECOND one onwards, so a
+      // single mention arrives as a bare string. Normalise before filtering, or mentioning exactly
+      // one person would silently record nothing.
+      const list = Array.isArray(mentionedIds) ? mentionedIds : [mentionedIds];
       const memberIds = conversation.participants.map((p) => p.toString());
-      mentions = mentionedIds.filter((id) => memberIds.includes(String(id)));
+      mentions = list.filter((id) => memberIds.includes(String(id)));
     }
 
     const message = new Message({

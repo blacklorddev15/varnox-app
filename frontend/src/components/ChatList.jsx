@@ -14,14 +14,15 @@ import { MdOutlineChat } from "react-icons/md";
 import useUserStore from "../store/useUserStore";
 import useLayoutStore from "../store/useLayoutStore";
 import useChatStore from "../store/useChatStore";
+import { toast } from "react-toastify";
 import { getAllUsers } from "../services/userService";
-import { searchMessages } from "../services/chat.api";
+import { searchMessages, createGroup } from "../services/chat.api";
 import { getAvatarUrl } from "../utils/avatarUtil";
 
 const ChatList = () => {
   const { user: currentUser } = useUserStore();
   const { selectedContact, setSelectedContact, setActiveTab } = useLayoutStore();
-  const { conversations, isUserOnline } = useChatStore();
+  const { conversations, isUserOnline, fetchConversations } = useChatStore();
 
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -32,6 +33,61 @@ const ChatList = () => {
   // Message-body search results, shown alongside the contact filter.
   const [messageResults, setMessageResults] = useState([]);
   const [searchingMessages, setSearchingMessages] = useState(false);
+
+  // --- Group creation --------------------------------------------------------------------------
+  const [showCreateGroup, setShowCreateGroup] = useState(false);
+  const [newGroupName, setNewGroupName] = useState("");
+  const [selectedMembers, setSelectedMembers] = useState([]);
+  const [creatingGroup, setCreatingGroup] = useState(false);
+
+  // Groups are conversations, not users, so they cannot come from the contact list.
+  const groups = (Array.isArray(conversations) ? conversations : []).filter((c) => c.isGroup);
+
+  const openGroup = (group) =>
+    setSelectedContact({
+      _id: group._id,
+      isGroup: true,
+      name: group.name,
+      participants: group.participants,
+      // Carried so ChatWindow can show admin-only controls. The server enforces this independently.
+      amIAdmin: (group.admins || []).some(
+        (a) => (a._id || a)?.toString() === currentUser?._id?.toString()
+      ),
+    });
+
+  const toggleMember = (id) =>
+    setSelectedMembers((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+
+  const handleCreateGroup = async () => {
+    const name = newGroupName.trim();
+
+    if (!name) {
+      toast.error("Give the group a name");
+      return;
+    }
+    if (!selectedMembers.length) {
+      toast.error("Select at least one member");
+      return;
+    }
+
+    setCreatingGroup(true);
+    try {
+      const res = await createGroup({ name, participantIds: selectedMembers });
+      const group = res?.data;
+
+      setShowCreateGroup(false);
+      setNewGroupName("");
+      setSelectedMembers([]);
+      await fetchConversations();
+
+      if (group?._id) openGroup(group);
+      toast.success("Group created");
+    } catch (err) {
+      toast.error(err?.message || "Could not create the group");
+    } finally {
+      setCreatingGroup(false);
+    }
+  };
 
   // Debounced, and only from 3 characters — the contact filter is instant and local, but this one
   // hits the API, so firing on every keystroke would be wasteful.
@@ -155,6 +211,16 @@ const ChatList = () => {
               >
                 <button
                   onClick={() => {
+                    setShowCreateGroup(true);
+                    setShowMenu(false);
+                  }}
+                  className="w-full text-left px-4 py-2 hover:bg-[#f0f2f5] dark:hover:bg-[#182229] text-[#111b21] dark:text-[#e9edef] flex items-center gap-2"
+                >
+                  <FaUsers className="w-3.5 h-3.5" />
+                  New group
+                </button>
+                <button
+                  onClick={() => {
                     setActiveTab("profile");
                     setShowMenu(false);
                   }}
@@ -271,6 +337,36 @@ const ChatList = () => {
         </div>
       )}
 
+      {/* Groups get their own section: the list below is built by mapping USERS, so a group is not
+          a user and would never appear there. */}
+      {groups.length > 0 && (
+        <div className="border-b border-[#e9edef] dark:border-[#222e35] max-h-64 overflow-y-auto">
+          <p className="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wider text-[#00a884] font-semibold">
+            Groups
+          </p>
+
+          {groups.map((g) => (
+            <button
+              key={g._id}
+              onClick={() => openGroup(g)}
+              className="w-full flex items-center gap-3 px-3 py-2.5 text-left hover:bg-black/5 dark:hover:bg-white/5"
+            >
+              <span className="w-10 h-10 rounded-full bg-[#00a884]/15 text-[#00a884] flex items-center justify-center flex-shrink-0">
+                <FaUsers className="w-4 h-4" />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block text-[14px] text-[#111b21] dark:text-[#e9edef] truncate">
+                  {g.name || "Group"}
+                </span>
+                <span className="block text-[11px] text-[#8696a0] truncate">
+                  {g.lastMessage?.content || `${g.participants?.length || 0} members`}
+                </span>
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+
       <div className="flex-1 overflow-y-auto divide-y divide-[#e9edef]/60 dark:divide-[#222e35]/60">
         {loading ? (
           <div className="flex flex-col items-center justify-center py-16 text-[#8696a0]">
@@ -346,6 +442,89 @@ const ChatList = () => {
           })
         )}
       </div>
+
+      {/* Create-group modal. Members come from the already-fetched user list; the server re-checks
+          that every id exists and always includes the creator. */}
+      {showCreateGroup && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+          <div className="w-full max-w-sm rounded-xl bg-white dark:bg-[#111b21] shadow-xl overflow-hidden flex flex-col max-h-[80vh]">
+            <div className="px-4 py-3 border-b border-[#e9edef] dark:border-[#222e35] flex items-center justify-between">
+              <p className="font-medium text-[#111b21] dark:text-[#e9edef]">New group</p>
+              <button
+                onClick={() => setShowCreateGroup(false)}
+                className="p-1.5 rounded-full text-[#8696a0] hover:bg-black/10 dark:hover:bg-white/10"
+                title="Cancel"
+              >
+                <FaTimes className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="px-4 py-3">
+              <input
+                value={newGroupName}
+                onChange={(e) => setNewGroupName(e.target.value)}
+                placeholder="Group name"
+                maxLength={60}
+                className="w-full px-3 py-2 rounded-lg bg-[#f0f2f5] dark:bg-[#202c33] text-[#111b21] dark:text-[#e9edef] text-sm outline-none focus:ring-1 focus:ring-[#00a884]"
+              />
+              <p className="mt-2 text-[11px] text-[#8696a0]">
+                {selectedMembers.length
+                  ? `${selectedMembers.length} member${selectedMembers.length === 1 ? "" : "s"} selected`
+                  : "Select at least one member"}
+              </p>
+            </div>
+
+            <div className="flex-1 overflow-y-auto border-t border-[#e9edef] dark:border-[#222e35]">
+              {users.length === 0 ? (
+                <p className="px-4 py-6 text-center text-sm text-[#8696a0]">No other users yet</p>
+              ) : (
+                users.map((u) => {
+                  const checked = selectedMembers.includes(u._id);
+                  return (
+                    <button
+                      key={u._id}
+                      onClick={() => toggleMember(u._id)}
+                      className="w-full flex items-center gap-3 px-4 py-2.5 text-left hover:bg-black/5 dark:hover:bg-white/5"
+                    >
+                      {u.profilePicture ? (
+                        <img
+                          src={getAvatarUrl(u.profilePicture)}
+                          alt=""
+                          className="w-9 h-9 rounded-full object-cover"
+                        />
+                      ) : (
+                        <span className="w-9 h-9 rounded-full bg-[#00a884]/15 text-[#00a884] flex items-center justify-center text-sm font-medium">
+                          {(u.username || "?").charAt(0).toUpperCase()}
+                        </span>
+                      )}
+                      <span className="flex-1 text-[14px] text-[#111b21] dark:text-[#e9edef] truncate">
+                        {u.username || u.email || "User"}
+                      </span>
+                      <span
+                        className={`w-5 h-5 rounded-full border flex items-center justify-center ${
+                          checked ? "bg-[#00a884] border-[#00a884]" : "border-[#8696a0]"
+                        }`}
+                      >
+                        {checked ? <FaCheck className="w-3 h-3 text-white" /> : null}
+                      </span>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+
+            <div className="px-4 py-3 border-t border-[#e9edef] dark:border-[#222e35]">
+              <button
+                onClick={handleCreateGroup}
+                disabled={creatingGroup}
+                className="w-full py-2.5 rounded-lg bg-[#00a884] hover:bg-[#02906f] text-white font-medium transition-colors disabled:opacity-50"
+              >
+                {creatingGroup ? "Creating…" : "Create group"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

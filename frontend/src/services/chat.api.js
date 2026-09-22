@@ -73,3 +73,31 @@ export const searchMessages = async (query) => {
   const res = await axiosInstance.get("/chat/search", { params: { q: query } });
   return res.data;
 };
+
+/* --- Groups ---------------------------------------------------------------------------------
+ * Every one of these is membership- or admin-checked server-side; the UI gating is only cosmetic.
+ */
+export const createGroup = async ({ name, participantIds }) => {
+  const res = await axiosInstance.post("/chat/groups", { name, participantIds });
+  return res.data;
+};
+
+export const updateGroup = async (groupId, { name, groupIcon }) => {
+  const res = await axiosInstance.put(`/chat/groups/${groupId}`, { name, groupIcon });
+  return res.data;
+};
+
+export const addGroupParticipants = async (groupId, participantIds) => {
+  const res = await axiosInstance.post(`/chat/groups/${groupId}/participants`, { participantIds });
+  return res.data;
+};
+
+export const removeGroupParticipant = async (groupId, participantId) => {
+  const res = await axiosInstance.delete(`/chat/groups/${groupId}/participants/${participantId}`);
+  return res.data;
+};
+
+export const leaveGroup = async (groupId) => {
+  const res = await axiosInstance.post(`/chat/groups/${groupId}/leave`);
+  return res.data;
+};

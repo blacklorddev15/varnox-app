@@ -19,6 +19,7 @@ import {
   FaReply,
   FaShare,
   FaMapMarkerAlt,
+  FaUsers,
 } from "react-icons/fa";
 import useUserStore from "../../store/useUserStore";
 import useChatStore from "../../store/useChatStore";
@@ -26,7 +27,14 @@ import useLayoutStore from "../../store/useLayoutStore";
 import { getAvatarUrl } from "../../utils/avatarUtil";
 import { toast } from "react-toastify";
 import { getCallConfig, ensureCallInit } from "../../services/trtc.service";
-import { forwardMessage as forwardMessageApi } from "../../services/chat.api";
+import {
+  forwardMessage as forwardMessageApi,
+  updateGroup,
+  addGroupParticipants,
+  removeGroupParticipant,
+  leaveGroup,
+} from "../../services/chat.api";
+import { getAllUsers } from "../../services/userService";
 import {
   startRecording,
   stopRecording,
@@ -66,7 +74,7 @@ const EMOJI_CATEGORIES = {
 const ChatWindow = () => {
   // Global Store States
   const { user: currentUser } = useUserStore();
-  const { selectedContact, clearSelectedContact } = useLayoutStore();
+  const { selectedContact, setSelectedContact, clearSelectedContact } = useLayoutStore();
 
   const {
     messages,
@@ -96,6 +104,125 @@ const ChatWindow = () => {
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 768);
   const [sending, setSending] = useState(false);
 
+  // --- Group chat -----------------------------------------------------------------------------
+  // A group is selected as a conversation-shaped contact: { _id: conversationId, isGroup, name,
+  // participants }. That keeps the existing contact-based selection working without a refactor.
+  const isGroupChat = Boolean(selectedContact?.isGroup);
+  const groupMemberCount = isGroupChat ? selectedContact?.participants?.length || 0 : 0;
+
+  // --- Group info panel ------------------------------------------------------------------------
+  const [showGroupInfo, setShowGroupInfo] = useState(false);
+  const [groupBusy, setGroupBusy] = useState(false);
+  const [renameValue, setRenameValue] = useState("");
+  const [allUsers, setAllUsers] = useState([]);
+  const [showAddMembers, setShowAddMembers] = useState(false);
+
+  const members = isGroupChat ? selectedContact?.participants || [] : [];
+
+  // Users who could still be added — anyone not already a member.
+  const addableMembers = allUsers.filter(
+    (u) => !members.some((m) => (m._id || m)?.toString() === u._id?.toString())
+  );
+
+  // Whether the current user is an admin, resolved when the group was opened (ChatList knows the
+  // admin list). Admin-only controls are hidden rather than shown and rejected — the server still
+  // enforces this, the flag is purely cosmetic.
+  const isAdmin = Boolean(selectedContact?.amIAdmin);
+
+  /** Re-point the selection at an updated group so the header reflects a rename or removal. */
+  const applyGroupUpdate = (group) => {
+    if (!group) return;
+    setSelectedContact({
+      _id: group._id,
+      isGroup: true,
+      name: group.name,
+      participants: group.participants,
+      amIAdmin: group.admins?.some(
+        (a) => (a._id?.toString() || a.toString()) === currentUser?._id?.toString()
+      ),
+    });
+  };
+
+  const openGroupInfo = async () => {
+    if (!isGroupChat) return;
+    setRenameValue(selectedContact?.name || "");
+    setShowGroupInfo(true);
+
+    // Only fetch the "add members" candidates when an admin opens the panel.
+    if (isAdmin) {
+      try {
+        const res = await getAllUsers();
+        setAllUsers(res?.data || res || []);
+      } catch {
+        setAllUsers([]);
+      }
+    }
+  };
+
+  const runGroupAction = async (fn, successMessage) => {
+    setGroupBusy(true);
+    try {
+      const res = await fn();
+      applyGroupUpdate(res?.data?.group || res?.data);
+      if (successMessage) toast.success(successMessage);
+    } catch (err) {
+      toast.error(err?.message || "That did not work");
+    } finally {
+      setGroupBusy(false);
+    }
+  };
+
+  const handleRenameGroup = () => {
+    const name = renameValue.trim();
+    if (!name) {
+      toast.error("Group name cannot be empty");
+      return;
+    }
+    return runGroupAction(() => updateGroup(selectedContact._id, { name }), "Group renamed");
+  };
+
+  const handleRemoveMember = (memberId) =>
+    runGroupAction(
+      () => removeGroupParticipant(selectedContact._id, memberId),
+      "Member removed"
+    );
+
+  const handleAddMember = (memberId) =>
+    runGroupAction(
+      () => addGroupParticipants(selectedContact._id, [memberId]),
+      "Member added"
+    );
+
+  const handleLeaveGroup = async () => {
+    setGroupBusy(true);
+    try {
+      await leaveGroup(selectedContact._id);
+      toast.success("You left the group");
+      setShowGroupInfo(false);
+      clearSelectedContact();
+      fetchConversations();
+    } catch (err) {
+      toast.error(err?.message || "Could not leave the group");
+    } finally {
+      setGroupBusy(false);
+    }
+  };
+
+  /**
+   * Address the outgoing message.
+   *
+   * Groups are addressed by conversation id — there is no single receiver. Appending a null
+   * receiverId would send the literal string "null" and break the server's ObjectId lookup.
+   */
+  const appendTarget = (formData) => {
+    if (isGroupChat) {
+      formData.append("conversationId", selectedContact._id);
+    } else {
+      formData.append("receiverId", selectedContact._id);
+    }
+    return formData;
+  };
+
   // --- Reply / forward -----------------------------------------------------------------------
   const [replyingTo, setReplyingTo] = useState(null);
   const [forwardingMsg, setForwardingMsg] = useState(null);
@@ -114,6 +241,38 @@ const ChatWindow = () => {
     const id = setInterval(() => setRecordSeconds((s) => s + 1), 1000);
     return () => clearInterval(id);
   }, [recording]);
+
+  // --- @mentions (groups only) ------------------------------------------------------------------
+  const [mentionQuery, setMentionQuery] = useState(null); // null = picker closed
+  const [pendingMentions, setPendingMentions] = useState([]); // user ids to send with the message
+
+  const mentionCandidates =
+    mentionQuery === null
+      ? []
+      : members
+          .filter((m) =>
+            (m.username || "").toLowerCase().startsWith(mentionQuery.toLowerCase())
+          )
+          .slice(0, 6);
+
+  const handleMessageChange = (value) => {
+    setMessage(value);
+
+    if (!isGroupChat) return;
+
+    // Open the picker while the caret sits at the end of an @word. Deliberately anchored to the
+    // end of the input, which is where someone typing a mention actually is.
+    const match = /@([a-zA-Z0-9_]*)$/.exec(value);
+    setMentionQuery(match ? match[1] : null);
+  };
+
+  const insertMention = (member) => {
+    const id = (member._id || member)?.toString();
+
+    setMessage((prev) => prev.replace(/@([a-zA-Z0-9_]*)$/, `@${member.username || ""} `));
+    setPendingMentions((prev) => (prev.includes(id) ? prev : [...prev, id]));
+    setMentionQuery(null);
+  };
 
   const handleStartRecording = async () => {
     try {
@@ -160,7 +319,7 @@ const ChatWindow = () => {
       // MediaRecorder labels audio-only recordings video/webm, so the server needs telling.
       formData.append("messageType", "audio");
       formData.append("duration", String(result.durationSeconds));
-      formData.append("receiverId", selectedContact._id);
+      appendTarget(formData);
       if (replyingTo?._id) formData.append("replyToId", replyingTo._id);
 
       await sendMessage(formData);
@@ -196,7 +355,7 @@ const ChatWindow = () => {
       const { latitude, longitude } = position.coords;
 
       const formData = new FormData();
-      formData.append("receiverId", selectedContact._id);
+      appendTarget(formData);
       formData.append("lat", String(latitude));
       formData.append("lng", String(longitude));
       formData.append("label", "Shared location");
@@ -372,7 +531,7 @@ const ChatWindow = () => {
     const isOnline = isUserOnline(selectedContact._id);
     const formData = new FormData();
     formData.append("senderId", currentUser._id);
-    formData.append("receiverId", selectedContact._id);
+    appendTarget(formData);
     formData.append("messageStatus", isOnline ? "delivered" : "sent");
 
     if (message.trim()) {
@@ -390,10 +549,16 @@ const ChatWindow = () => {
       formData.append("replyToId", replyingTo._id);
     }
 
+    // One field per mention, so the server receives an array. It re-validates membership anyway,
+    // so a stale id here can never mention somebody outside the group.
+    pendingMentions.forEach((id) => formData.append("mentions", id));
+
     // Flush local inputs immediately
     setMessage("");
     clearFile();
     setReplyingTo(null);
+    setPendingMentions([]);
+    setMentionQuery(null);
     setShowEmojiPicker(false);
     setShowFileMenu(false);
 
@@ -489,27 +654,42 @@ const ChatWindow = () => {
             </button>
           )}
 
-          <div className="relative">
-            <img
-              src={getAvatarUrl(selectedContact, selectedContact?.username)}
-              alt={selectedContact?.username}
-              onError={(e) => {
-                e.target.onerror = null;
-                e.target.src = getAvatarUrl(null, selectedContact?.username);
-              }}
-              className="w-10 h-10 rounded-full object-cover bg-gray-200 dark:bg-gray-700 cursor-pointer"
-            />
-            {isContactOnline && (
-              <span className="absolute bottom-0 right-0 w-2.5 h-2.5 bg-[#25d366] rounded-full border-2 border-white dark:border-[#202c33]" />
-            )}
-          </div>
+          {isGroupChat ? (
+            <button
+              onClick={openGroupInfo}
+              className="w-10 h-10 rounded-full bg-[#00a884]/15 text-[#00a884] flex items-center justify-center flex-shrink-0 hover:bg-[#00a884]/25 transition-colors"
+              title="Group info"
+            >
+              <FaUsers className="w-5 h-5" />
+            </button>
+          ) : (
+            <div className="relative">
+              <img
+                src={getAvatarUrl(selectedContact, selectedContact?.username)}
+                alt={selectedContact?.username}
+                onError={(e) => {
+                  e.target.onerror = null;
+                  e.target.src = getAvatarUrl(null, selectedContact?.username);
+                }}
+                className="w-10 h-10 rounded-full object-cover bg-gray-200 dark:bg-gray-700 cursor-pointer"
+              />
+              {isContactOnline && (
+                <span className="absolute bottom-0 right-0 w-2.5 h-2.5 bg-[#25d366] rounded-full border-2 border-white dark:border-[#202c33]" />
+              )}
+            </div>
+          )}
 
-          <div>
+          <div
+            className={isGroupChat ? "cursor-pointer" : undefined}
+            onClick={isGroupChat ? openGroupInfo : undefined}
+          >
             <h2 className="text-sm font-semibold text-[#111b21] dark:text-[#e9edef] leading-tight">
-              {selectedContact?.username}
+              {isGroupChat ? selectedContact?.name || "Group" : selectedContact?.username}
             </h2>
             <span className="text-[11px] text-[#54656f] dark:text-[#8696a0] transition-colors">
-              {isContactTyping ? (
+              {isGroupChat ? (
+                `${groupMemberCount} member${groupMemberCount === 1 ? "" : "s"}`
+              ) : isContactTyping ? (
                 <span className="text-[#00a884] font-medium animate-pulse">typing...</span>
               ) : isContactOnline ? (
                 <span className="text-[#00a884] font-medium">online</span>
@@ -523,8 +703,10 @@ const ChatWindow = () => {
         </div>
 
         <div className="flex items-center gap-1 text-[#54656f] dark:text-[#aebac1]">
-          {/* Rendered only when the server reports TRTC is configured. */}
-          {callConfig.enabled && (
+          {/* Calls are 1-to-1 only — TUICallKit takes a single callee userID, and a group
+              conversation id is not a callable peer. Hidden in groups rather than offered and
+              failing. */}
+          {callConfig.enabled && !isGroupChat && (
             <>
               <button
                 onClick={() => startCall(true)}
@@ -590,6 +772,14 @@ const ChatWindow = () => {
                           : "bg-white dark:bg-[#202c33] rounded-tl-none"
                       }`}
                     >
+                      {/* Sender name — groups only, and only for other people's messages.
+                          Without it a group becomes unreadable past two participants. */}
+                      {isGroupChat && !isMine && (
+                        <p className="mb-0.5 text-[11.5px] font-semibold text-[#00a884]">
+                          {msg.sender?.username || "Member"}
+                        </p>
+                      )}
+
                       {/* Forwarded badge */}
                       {msg.isForwarded && (
                         <div className="flex items-center gap-1 mb-1 text-[11px] italic text-[#8696a0]">
@@ -908,6 +1098,176 @@ const ChatWindow = () => {
         className="hidden"
       />
 
+      {/* Group info panel. Admin-only controls are hidden for non-admins; the server enforces the
+          same rules regardless, so hiding them is cosmetic rather than a security boundary. */}
+      {showGroupInfo && isGroupChat && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+          <div className="w-full max-w-sm rounded-xl bg-white dark:bg-[#111b21] shadow-xl overflow-hidden flex flex-col max-h-[80vh]">
+            <div className="px-4 py-3 border-b border-[#e9edef] dark:border-[#222e35] flex items-center justify-between">
+              <p className="font-medium text-[#111b21] dark:text-[#e9edef]">Group info</p>
+              <button
+                onClick={() => {
+                  setShowGroupInfo(false);
+                  setShowAddMembers(false);
+                }}
+                className="p-1.5 rounded-full text-[#8696a0] hover:bg-black/10 dark:hover:bg-white/10"
+                title="Close"
+              >
+                <FaTimes className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto">
+              <div className="px-4 py-3 border-b border-[#e9edef] dark:border-[#222e35]">
+                <p className="text-[11px] uppercase tracking-wider text-[#00a884] font-semibold mb-2">
+                  Name
+                </p>
+                {isAdmin ? (
+                  <div className="flex gap-2">
+                    <input
+                      value={renameValue}
+                      onChange={(e) => setRenameValue(e.target.value)}
+                      maxLength={60}
+                      className="flex-1 px-3 py-2 rounded-lg bg-[#f0f2f5] dark:bg-[#202c33] text-[#111b21] dark:text-[#e9edef] text-sm outline-none focus:ring-1 focus:ring-[#00a884]"
+                    />
+                    <button
+                      onClick={handleRenameGroup}
+                      disabled={groupBusy}
+                      className="px-3 rounded-lg bg-[#00a884] text-white text-sm disabled:opacity-50"
+                    >
+                      Save
+                    </button>
+                  </div>
+                ) : (
+                  <p className="text-[14px] text-[#111b21] dark:text-[#e9edef]">
+                    {selectedContact?.name}
+                  </p>
+                )}
+              </div>
+
+              <div className="px-4 py-3">
+                <div className="flex items-center justify-between mb-1">
+                  <p className="text-[11px] uppercase tracking-wider text-[#00a884] font-semibold">
+                    {groupMemberCount} member{groupMemberCount === 1 ? "" : "s"}
+                  </p>
+                  {isAdmin && (
+                    <button
+                      onClick={() => setShowAddMembers((v) => !v)}
+                      className="text-[11px] text-[#00a884] font-medium"
+                    >
+                      {showAddMembers ? "Done" : "+ Add"}
+                    </button>
+                  )}
+                </div>
+
+                {members.map((m) => {
+                  const id = (m._id || m)?.toString();
+                  const name = m.username || "Member";
+                  const isMe = id === currentUser?._id?.toString();
+
+                  return (
+                    <div key={id} className="flex items-center gap-3 py-2">
+                      {m.profilePicture ? (
+                        <img
+                          src={getAvatarUrl(m.profilePicture)}
+                          alt=""
+                          className="w-9 h-9 rounded-full object-cover"
+                        />
+                      ) : (
+                        <span className="w-9 h-9 rounded-full bg-[#00a884]/15 text-[#00a884] flex items-center justify-center text-sm font-medium">
+                          {name.charAt(0).toUpperCase()}
+                        </span>
+                      )}
+                      <span className="flex-1 text-[14px] text-[#111b21] dark:text-[#e9edef] truncate">
+                        {name}
+                        {isMe ? " (you)" : ""}
+                      </span>
+                      {isAdmin && !isMe && (
+                        <button
+                          onClick={() => handleRemoveMember(id)}
+                          disabled={groupBusy}
+                          className="p-1.5 rounded-full text-[#8696a0] hover:text-red-500 hover:bg-black/10 dark:hover:bg-white/10 disabled:opacity-40"
+                          title="Remove from group"
+                        >
+                          <FaTimes className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {showAddMembers && isAdmin && (
+                  <div className="mt-2 pt-2 border-t border-[#e9edef] dark:border-[#222e35]">
+                    {addableMembers.length === 0 ? (
+                      <p className="py-2 text-[11px] text-[#8696a0]">
+                        Everyone is already in this group
+                      </p>
+                    ) : (
+                      addableMembers.map((u) => (
+                        <button
+                          key={u._id}
+                          onClick={() => handleAddMember(u._id)}
+                          disabled={groupBusy}
+                          className="w-full flex items-center gap-3 py-2 text-left hover:bg-black/5 dark:hover:bg-white/5 disabled:opacity-40"
+                        >
+                          <span className="w-8 h-8 rounded-full bg-[#00a884]/15 text-[#00a884] flex items-center justify-center text-xs font-medium">
+                            {(u.username || "?").charAt(0).toUpperCase()}
+                          </span>
+                          <span className="flex-1 text-[13.5px] text-[#111b21] dark:text-[#e9edef] truncate">
+                            {u.username || u.email}
+                          </span>
+                        </button>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="px-4 py-3 border-t border-[#e9edef] dark:border-[#222e35]">
+              <button
+                onClick={handleLeaveGroup}
+                disabled={groupBusy}
+                className="w-full py-2.5 rounded-lg bg-red-500/10 text-red-500 font-medium hover:bg-red-500/20 transition-colors disabled:opacity-50"
+              >
+                Leave group
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* @mention picker. Only ever shown in a group, and only while an @word is being typed. */}
+      {isGroupChat && mentionQuery !== null && mentionCandidates.length > 0 && (
+        <div className="mx-3 mb-1 rounded-lg bg-white dark:bg-[#233138] shadow-xl border border-gray-100 dark:border-[#222e35] overflow-hidden z-20">
+          {mentionCandidates.map((m) => {
+            const name = m.username || "Member";
+            return (
+              <button
+                key={(m._id || m)?.toString()}
+                onClick={() => insertMention(m)}
+                className="w-full flex items-center gap-3 px-3 py-2 text-left hover:bg-black/5 dark:hover:bg-white/5"
+              >
+                {m.profilePicture ? (
+                  <img
+                    src={getAvatarUrl(m.profilePicture)}
+                    alt=""
+                    className="w-7 h-7 rounded-full object-cover"
+                  />
+                ) : (
+                  <span className="w-7 h-7 rounded-full bg-[#00a884]/15 text-[#00a884] flex items-center justify-center text-xs font-medium">
+                    {name.charAt(0).toUpperCase()}
+                  </span>
+                )}
+                <span className="text-[13px] text-[#111b21] dark:text-[#e9edef] truncate">
+                  {name}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       {/* Recording strip. Takes over the composer's role while a voice note is being captured. */}
       {recording && (
         <div className="px-3 py-2.5 bg-[#f0f2f5] dark:bg-[#202c33] border-t border-[#e9edef] dark:border-[#222e35] flex items-center gap-3 z-20">
@@ -1067,7 +1427,7 @@ const ChatWindow = () => {
             type="text"
             placeholder="Type a message"
             value={message}
-            onChange={(e) => setMessage(e.target.value)}
+            onChange={(e) => handleMessageChange(e.target.value)}
             onKeyDown={handleKeyDown}
             className="w-full h-10 px-4 bg-white dark:bg-[#2a3942] text-sm text-[#111b21] dark:text-[#e9edef] placeholder-[#8696a0] rounded-lg outline-none transition-colors"
           />

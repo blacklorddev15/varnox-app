@@ -458,10 +458,13 @@ const useChatStore = create((set, get) => ({
     const socket = getSocket();
     const { conversations } = get();
 
-    // 2. Resolve or find matching conversation ID
-    let conversationId = null;
+    // 2. Resolve the conversation ID.
+    //    An explicit conversationId wins: a group has no single counterpart, so the participant-pair
+    //    lookup below cannot identify it. The client always supplies it for group chats.
+    let conversationId = isFormData ? formData.get("conversationId") : formData?.conversationId;
+
     const convList = Array.isArray(conversations) ? conversations : conversations?.data || [];
-    if (convList.length > 0) {
+    if (!conversationId && convList.length > 0) {
       const matchedConv = convList.find(
         (conv) =>
           conv.participants?.some((p) => (p._id || p)?.toString() === senderId?.toString()) &&
@@ -479,7 +482,8 @@ const useChatStore = create((set, get) => ({
       _id: tempId,
       tempId,
       sender: { _id: senderId },
-      receiver: { _id: receiverId },
+      // Null for group messages — a group has no single recipient.
+      receiver: receiverId ? { _id: receiverId } : null,
       conversation: conversationId,
       imageOrVideoUrl:
         media && typeof media !== "string"
@@ -505,14 +509,17 @@ const useChatStore = create((set, get) => ({
       if (!isFormData) {
         if (media) {
           payload = new FormData();
-          payload.append("senderId", senderId);
-          payload.append("receiverId", receiverId);
+           payload.append("senderId", senderId);
+           // Never append a null receiver: it would be sent as the literal string "null" and
+           // break the server's ObjectId lookup.
+           if (receiverId) payload.append("receiverId", receiverId);
+           if (conversationId) payload.append("conversationId", conversationId);
           if (content) payload.append("content", content);
           payload.append("media", media);
           payload.append("file", media);
           if (messageStatus) payload.append("messageStatus", messageStatus);
         } else {
-          payload = { senderId, receiverId, content, messageStatus };
+          payload = { senderId, receiverId, conversationId, content, messageStatus };
         }
       } else {
         if (formData.has("media") && !formData.has("file")) {
