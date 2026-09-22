@@ -12,11 +12,22 @@ const messageSchema = new mongoose.Schema(
       ref: "User",
       required: true,
     },
+    // Absent on group messages: a group has no single recipient. 1-to-1 messages still set it.
     receiver: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
-      required: true,
     },
+    // Per-member read state for groups. A single `messageStatus` cannot express "read by 3 of 5",
+    // so membership of this array is the source of truth for group read receipts.
+    readBy: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+    }],
+    // Users @mentioned in this message, resolved server-side from the message body.
+    mentions: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+    }],
     content: {
         type: String,
     },

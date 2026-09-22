@@ -1,5 +1,6 @@
 const Conversation = require("../models/Conversation");
 const Message = require("../models/Message");
+const User = require("../models/User");
 const { uploadOnCloudinary } = require("../config/cloudinaryConfig");
 const response = require("../utils/responseHandler");
 
@@ -8,6 +9,7 @@ exports.sendMessage = async (req, res) => {
     const {
       senderId,
       receiverId,
+      conversationId,
       content,
       messageStatus,
       replyToId,
@@ -20,25 +22,57 @@ exports.sendMessage = async (req, res) => {
       lat,
       lng,
       label,
+      // @mentions, as user ids supplied by the client's autocomplete and validated below.
+      mentions: mentionedIds,
     } = req.body;
     const effectiveSenderId = senderId || req.user?._id;
     const file = req.file;
 
-    if (!effectiveSenderId || !receiverId) {
-      return response(res, 400, "Sender and receiver IDs are required");
+    if (!effectiveSenderId) {
+      return response(res, 400, "Sender is required");
     }
 
-    let conversation = await Conversation.findOne({
-      participants: { $all: [effectiveSenderId, receiverId] },
-    });
+    // A conversation can be addressed two ways:
+    //   conversationId — groups, and 1-to-1 once the client knows the id
+    //   receiverId     — creates or reuses the pairwise conversation (unchanged behaviour)
+    let conversation;
 
-    if (!conversation) {
-      conversation = new Conversation({
-        participants: [effectiveSenderId, receiverId],
-        lastMessage: null,
-        unreadCount: 0,
+    if (conversationId) {
+      conversation = await Conversation.findById(conversationId);
+
+      if (!conversation) {
+        return response(res, 404, "Conversation not found");
+      }
+
+      // Membership is mandatory. Without this check, anyone could post into any conversation
+      // simply by knowing its id.
+      const isMember = conversation.participants
+        .map((p) => p.toString())
+        .includes(effectiveSenderId.toString());
+
+      if (!isMember) {
+        return response(res, 403, "You are not a participant in this conversation");
+      }
+    } else {
+      if (!receiverId) {
+        return response(res, 400, "Sender and receiver IDs are required");
+      }
+
+      conversation = await Conversation.findOne({
+        participants: { $all: [effectiveSenderId, receiverId] },
+        // Exclude groups: two members of the same group would otherwise have their group hijacked
+        // as their private 1-to-1 thread.
+        isGroup: { $ne: true },
       });
-      await conversation.save();
+
+      if (!conversation) {
+        conversation = new Conversation({
+          participants: [effectiveSenderId, receiverId],
+          lastMessage: null,
+          unreadCount: 0,
+        });
+        await conversation.save();
+      }
     }
 
     let imageOrVideoUrl = null;
@@ -118,16 +152,37 @@ exports.sendMessage = async (req, res) => {
       replyTo = quoted._id;
     }
 
+    // For a 1-to-1 message the receiver is simply the other participant, so the client can address
+    // a conversation by id without needing to know who the counterpart is. Groups have no receiver.
+    let effectiveReceiverId = receiverId || null;
+
+    if (!effectiveReceiverId && !conversation.isGroup) {
+      const other = conversation.participants.find(
+        (p) => p.toString() !== effectiveSenderId.toString()
+      );
+      effectiveReceiverId = other || null;
+    }
+
+    // Mentions arrive from the client's autocomplete, then are filtered against real membership so
+    // a crafted request cannot mention somebody outside the group.
+    let mentions = [];
+
+    if (conversation.isGroup && Array.isArray(mentionedIds)) {
+      const memberIds = conversation.participants.map((p) => p.toString());
+      mentions = mentionedIds.filter((id) => memberIds.includes(String(id)));
+    }
+
     const message = new Message({
       conversation: conversation._id,
       sender: effectiveSenderId,
-      receiver: receiverId,
+      receiver: effectiveReceiverId,
       content: content || null,
       contentType: contentType,
       imageOrVideoUrl: imageOrVideoUrl,
       fileMeta,
       location,
       replyTo,
+      mentions,
       isForwarded: isForwarded === true || isForwarded === "true",
       messageStatus: messageStatus || "sent",
     });
@@ -149,9 +204,26 @@ exports.sendMessage = async (req, res) => {
       });
 
     if (req.io && req.socketUserMap) {
-      const receiverSocketId = req.socketUserMap.get(receiverId?.toString());
-      if (receiverSocketId) {
-        req.io.to(receiverSocketId).emit("receiveMessage", populatedMessage);
+      // Groups fan out to every participant except the sender; 1-to-1 stays a single emit.
+      const targetIds = conversation.isGroup
+        ? conversation.participants
+            .map((p) => p.toString())
+            .filter((id) => id !== effectiveSenderId.toString())
+        : [effectiveReceiverId?.toString()].filter(Boolean);
+
+      let anyDelivered = false;
+
+      targetIds.forEach((id) => {
+        const socketId = req.socketUserMap.get(id);
+        if (socketId) {
+          req.io.to(socketId).emit("receiveMessage", populatedMessage);
+          anyDelivered = true;
+        }
+      });
+
+      // "delivered" is meaningless for a group — with N recipients there is no single state, so
+      // groups rely on `readBy` instead.
+      if (anyDelivered && !conversation.isGroup) {
         message.messageStatus = "delivered";
         await message.save();
       }
@@ -284,12 +356,35 @@ exports.markAsRead = async (req, res) => {
     if (!message) {
       return response(res, 404, "Message not found");
     }
-    if (message.receiver.toString() !== userId.toString()) {
-      return response(res, 403, "You are not the receiver of this message");
-    }
 
-    message.messageStatus = "read";
-    await message.save();
+    const conversation = await Conversation.findById(message.conversation).select(
+      "isGroup participants"
+    );
+    const isGroupMessage = Boolean(conversation?.isGroup);
+
+    if (isGroupMessage) {
+      // Any member may mark a group message read, and who read it is tracked separately: a single
+      // status field cannot express "read by 3 of 5".
+      const isMember = conversation.participants
+        .map((p) => p.toString())
+        .includes(userId.toString());
+
+      if (!isMember) {
+        return response(res, 403, "You are not a participant in this conversation");
+      }
+
+      if (!message.readBy.some((id) => id.toString() === userId.toString())) {
+        message.readBy.push(userId);
+        await message.save();
+      }
+    } else {
+      if (message.receiver?.toString() !== userId.toString()) {
+        return response(res, 403, "You are not the receiver of this message");
+      }
+
+      message.messageStatus = "read";
+      await message.save();
+    }
 
     if (req.io && req.socketUserMap) {
       const senderSocketId = req.socketUserMap.get(message.sender.toString());
@@ -522,4 +617,199 @@ exports.forwardMessage = async (req, res) => {
     console.error("Error forwarding message:", error);
     return response(res, 500, "Failed to forward message", { error: error.message });
   }
+};
+
+/* ---------------------------------------------------------------------------------------------
+ * Groups
+ *
+ * A group is a Conversation with isGroup: true, reusing `participants` as the member list so the
+ * existing pairwise queries keep working. Every mutating endpoint below checks membership or admin
+ * rights — without those checks, a group id would be enough to rename a group, evict its members,
+ * or post into it.
+ * -------------------------------------------------------------------------------------------*/
+
+const isMemberOf = (conversation, userId) =>
+  conversation.participants.map((p) => p.toString()).includes(userId.toString());
+
+const isAdminOf = (conversation, userId) =>
+  conversation.admins.some((a) => a.toString() === userId.toString());
+
+const populateGroup = (id) =>
+  Conversation.findById(id)
+    .populate("participants", "username profilePicture isOnline lastSeen")
+    .populate("admins", "username profilePicture");
+
+exports.createGroup = async (req, res) => {
+  const userId = req.user?._id || req.user?.userId;
+  const { name, participantIds } = req.body;
+
+  try {
+    const groupName = String(name || "").trim();
+    if (!groupName) {
+      return response(res, 400, "A group name is required");
+    }
+    if (groupName.length > 60) {
+      return response(res, 400, "Group name is too long (60 characters maximum)");
+    }
+
+    // Deduplicate and always include the creator, so a malformed request cannot produce a group
+    // its own creator is not a member of.
+    const members = [
+      ...new Set([
+        ...(Array.isArray(participantIds) ? participantIds.map(String) : []),
+        userId.toString(),
+      ]),
+    ];
+
+    const found = await User.countDocuments({ _id: { $in: members } });
+    if (found !== members.length) {
+      return response(res, 400, "One or more selected members do not exist");
+    }
+
+    const group = await Conversation.create({
+      participants: members,
+      isGroup: true,
+      name: groupName,
+      admins: [userId],
+      createdBy: userId,
+      unreadCount: 0,
+    });
+
+    return response(res, 201, "Group created", await populateGroup(group._id));
+  } catch (error) {
+    console.error("Error creating group:", error);
+    return response(res, 500, "Failed to create group", { error: error.message });
+  }
+};
+
+exports.updateGroup = async (req, res) => {
+  const userId = req.user?._id || req.user?.userId;
+  const { groupId } = req.params;
+  const { name, groupIcon } = req.body;
+
+  try {
+    const group = await Conversation.findOne({ _id: groupId, isGroup: true });
+    if (!group) {
+      return response(res, 404, "Group not found");
+    }
+    if (!isAdminOf(group, userId)) {
+      return response(res, 403, "Only a group admin can change these details");
+    }
+
+    if (name !== undefined) {
+      const next = String(name).trim();
+      if (!next) {
+        return response(res, 400, "Group name cannot be empty");
+      }
+      group.name = next.slice(0, 60);
+    }
+
+    if (groupIcon !== undefined) {
+      group.groupIcon = groupIcon || null;
+    }
+
+    await group.save();
+    return response(res, 200, "Group updated", await populateGroup(group._id));
+  } catch (error) {
+    console.error("Error updating group:", error);
+    return response(res, 500, "Failed to update group", { error: error.message });
+  }
+};
+
+exports.addParticipants = async (req, res) => {
+  const userId = req.user?._id || req.user?.userId;
+  const { groupId } = req.params;
+  const { participantIds } = req.body;
+
+  try {
+    const group = await Conversation.findOne({ _id: groupId, isGroup: true });
+    if (!group) {
+      return response(res, 404, "Group not found");
+    }
+    if (!isAdminOf(group, userId)) {
+      return response(res, 403, "Only a group admin can add members");
+    }
+
+    const current = group.participants.map((p) => p.toString());
+    const toAdd = [
+      ...new Set(
+        (Array.isArray(participantIds) ? participantIds : [])
+          .map(String)
+          .filter((id) => !current.includes(id))
+      ),
+    ];
+
+    if (!toAdd.length) {
+      return response(res, 400, "Those users are already in the group");
+    }
+
+    const found = await User.countDocuments({ _id: { $in: toAdd } });
+    if (found !== toAdd.length) {
+      return response(res, 400, "One or more selected users do not exist");
+    }
+
+    group.participants.push(...toAdd);
+    await group.save();
+
+    return response(res, 200, "Members added", await populateGroup(group._id));
+  } catch (error) {
+    console.error("Error adding members:", error);
+    return response(res, 500, "Failed to add members", { error: error.message });
+  }
+};
+
+exports.removeParticipant = async (req, res) => {
+  const userId = req.user?._id || req.user?.userId;
+  const { groupId, participantId } = req.params;
+
+  try {
+    const group = await Conversation.findOne({ _id: groupId, isGroup: true });
+    if (!group) {
+      return response(res, 404, "Group not found");
+    }
+
+    const target = String(participantId);
+    const removingSelf = target === userId.toString();
+
+    // Leaving is always allowed; removing someone else requires admin rights.
+    if (!removingSelf && !isAdminOf(group, userId)) {
+      return response(res, 403, "Only a group admin can remove members");
+    }
+
+    if (!group.participants.map((p) => p.toString()).includes(target)) {
+      return response(res, 404, "That user is not in this group");
+    }
+
+    const remaining = group.participants.filter((p) => p.toString() !== target);
+
+    if (!remaining.length) {
+      // Last member out: the group has no reason to exist.
+      await Message.deleteMany({ conversation: group._id });
+      await group.deleteOne();
+      return response(res, 200, "You left the group and it was removed");
+    }
+
+    group.participants = remaining;
+    group.admins = group.admins.filter((a) => a.toString() !== target);
+
+    // Never leave a group without an admin, or nobody could rename it or manage members again.
+    if (!group.admins.length) {
+      group.admins = [remaining[0]];
+    }
+
+    await group.save();
+
+    return response(res, 200, removingSelf ? "You left the group" : "Member removed", {
+      group: await populateGroup(group._id),
+      removedUserId: target,
+    });
+  } catch (error) {
+    console.error("Error removing member:", error);
+    return response(res, 500, "Failed to remove member", { error: error.message });
+  }
+};
+
+exports.leaveGroup = async (req, res) => {
+  req.params.participantId = (req.user?._id || req.user?.userId).toString();
+  return exports.removeParticipant(req, res);
 };

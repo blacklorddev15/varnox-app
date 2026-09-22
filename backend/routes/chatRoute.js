@@ -25,3 +25,9 @@ router.get("/search", authMiddleware, chatController.searchMessages);
 router.post("/forward", authMiddleware, chatController.forwardMessage);
 
 module.exports = router; 
+// Groups. Every mutating route checks membership or admin rights in the controller.
+router.post("/groups", authMiddleware, chatController.createGroup);
+router.put("/groups/:groupId", authMiddleware, chatController.updateGroup);
+router.post("/groups/:groupId/participants", authMiddleware, chatController.addParticipants);
+router.delete("/groups/:groupId/participants/:participantId", authMiddleware, chatController.removeParticipant);
+router.post("/groups/:groupId/leave", authMiddleware, chatController.leaveGroup);
