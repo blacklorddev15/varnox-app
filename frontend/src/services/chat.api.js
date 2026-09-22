@@ -23,9 +23,9 @@ export const getMessages = async (conversationId) => {
 
 export const sendMessage = async (payload) => {
   const isFormData = typeof FormData !== "undefined" && payload instanceof FormData;
-  const res = await axiosInstance.post("/chat/send-message", payload, {
-    headers: isFormData ? { "Content-Type": "multipart/form-data" } : undefined,
-  });
+  // Same reasoning as useChatStore: never set Content-Type for FormData, or the multipart
+  // boundary is missing and multer rejects the request.
+  const res = await axiosInstance.post("/chat/send-message", payload);
   return res.data;
 };
 

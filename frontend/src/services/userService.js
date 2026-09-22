@@ -70,9 +70,11 @@ export const updateUserProfile = async (data) => {
   try {
     const isFormData = typeof FormData !== "undefined" && data instanceof FormData;
     const res = await axiosInstance.put("/auth/update-profile", data, {
-      headers: isFormData
-        ? { "Content-Type": "multipart/form-data" }
-        : { "Content-Type": "application/json" },
+      // Never set Content-Type for FormData. Only the browser knows the multipart boundary it
+      // generates; a manually-set bare "multipart/form-data" carries no boundary, and multer
+      // rejects the request outright with "Multipart: Boundary not found". That is what broke
+      // profile photo uploads.
+      headers: isFormData ? undefined : { "Content-Type": "application/json" },
     });
     return res.data;
   } catch (err) {

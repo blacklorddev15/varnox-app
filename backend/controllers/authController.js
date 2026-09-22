@@ -169,9 +169,18 @@ const updateProfile = async (req, res) => {
         const uploadResult = await uploadOnCloudinary(req.file);
         if (uploadResult?.secure_url) {
           updates.profilePicture = uploadResult.secure_url;
+        } else {
+          return response(res, 502, "Could not store the profile picture. Please try again.");
         }
       } catch (uploadErr) {
+        // This used to be logged and then execution carried on, so the caller got a cheerful
+        // "No changes made" while the photo silently never saved. Surface the failure instead.
         console.error("Profile picture upload failed:", uploadErr.message);
+        return response(
+          res,
+          502,
+          "Profile picture storage is unavailable. Please try again later."
+        );
       }
     } else if (avatarUrl !== undefined) {
       updates.profilePicture = avatarUrl || "";

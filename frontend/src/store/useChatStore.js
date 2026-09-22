@@ -523,12 +523,12 @@ const useChatStore = create((set, get) => ({
         }
       }
 
-      const response = await axiosInstance.post("/chats/send-message", payload, {
-        headers:
-          isFormData || payload instanceof FormData
-            ? { "Content-Type": "multipart/form-data" }
-            : undefined,
-      });
+      // Do NOT set Content-Type here. For FormData the browser must choose it, because only it
+      // knows the multipart boundary it generates — a manually-set "multipart/form-data" has no
+      // boundary and multer rejects the request with "Multipart: Boundary not found". For JSON
+      // bodies axios sets application/json on its own. This bug affected photo/video messages as
+      // well as profile pictures.
+      const response = await axiosInstance.post("/chats/send-message", payload);
       const realMessageData =
         response.data?.data || response.data?.message || response.data;
 
