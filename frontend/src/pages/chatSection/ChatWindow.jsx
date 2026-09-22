@@ -18,6 +18,7 @@ import {
   FaPhoneAlt,
   FaReply,
   FaShare,
+  FaMapMarkerAlt,
 } from "react-icons/fa";
 import useUserStore from "../../store/useUserStore";
 import useChatStore from "../../store/useChatStore";
@@ -26,6 +27,11 @@ import { getAvatarUrl } from "../../utils/avatarUtil";
 import { toast } from "react-toastify";
 import { getCallConfig, ensureCallInit } from "../../services/trtc.service";
 import { forwardMessage as forwardMessageApi } from "../../services/chat.api";
+import {
+  startRecording,
+  stopRecording,
+  cancelRecording,
+} from "../../services/voiceRecorder";
 
 // Varnox Delivery Status Ticks
 const StatusTick = ({ status }) => {
@@ -94,6 +100,123 @@ const ChatWindow = () => {
   const [replyingTo, setReplyingTo] = useState(null);
   const [forwardingMsg, setForwardingMsg] = useState(null);
   const [forwarding, setForwarding] = useState(false);
+
+  // --- Voice notes & location ------------------------------------------------------------------
+  const [recording, setRecording] = useState(false);
+  const [recordSeconds, setRecordSeconds] = useState(0);
+  const [sendingVoice, setSendingVoice] = useState(false);
+  const [sendingLocation, setSendingLocation] = useState(false);
+
+  // Drives the recording timer. Kept separate from the recorder so the UI is a pure function of
+  // state and the timer cannot drift if a render is skipped.
+  useEffect(() => {
+    if (!recording) return;
+    const id = setInterval(() => setRecordSeconds((s) => s + 1), 1000);
+    return () => clearInterval(id);
+  }, [recording]);
+
+  const handleStartRecording = async () => {
+    try {
+      setShowFileMenu(false);
+      await startRecording();
+      setRecordSeconds(0);
+      setRecording(true);
+    } catch (err) {
+      toast.error(
+        err?.message || "Could not start recording. Check the microphone permission."
+      );
+    }
+  };
+
+  const handleCancelRecording = async () => {
+    await cancelRecording();
+    setRecording(false);
+    setRecordSeconds(0);
+  };
+
+  const handleSendRecording = async () => {
+    if (sendingVoice) return;
+    setSendingVoice(true);
+
+    try {
+      const result = await stopRecording();
+      setRecording(false);
+      setRecordSeconds(0);
+
+      if (!result?.blob) return;
+
+      if (!selectedContact?._id) {
+        toast.error("No conversation selected");
+        return;
+      }
+
+      // Safari records mp4/m4a, Chrome webm — the extension should match or some clients refuse
+      // to play it back.
+      const ext = result.mimeType.includes("mp4") ? "m4a" : "webm";
+
+      const formData = new FormData();
+      formData.append("media", result.blob, `voice-note.${ext}`);
+      formData.append("file", result.blob, `voice-note.${ext}`);
+      // MediaRecorder labels audio-only recordings video/webm, so the server needs telling.
+      formData.append("messageType", "audio");
+      formData.append("duration", String(result.durationSeconds));
+      formData.append("receiverId", selectedContact._id);
+      if (replyingTo?._id) formData.append("replyToId", replyingTo._id);
+
+      await sendMessage(formData);
+      setReplyingTo(null);
+    } catch (err) {
+      toast.error(err?.message || "Could not send the voice message");
+    } finally {
+      setSendingVoice(false);
+    }
+  };
+
+  const handleShareLocation = async () => {
+    if (sendingLocation) return;
+
+    if (!navigator.geolocation) {
+      toast.error("Location is not available on this device");
+      return;
+    }
+    if (!selectedContact?._id) return;
+
+    setShowFileMenu(false);
+    setSendingLocation(true);
+
+    try {
+      const position = await new Promise((resolve, reject) =>
+        navigator.geolocation.getCurrentPosition(resolve, reject, {
+          enableHighAccuracy: true,
+          timeout: 15000,
+          maximumAge: 0,
+        })
+      );
+
+      const { latitude, longitude } = position.coords;
+
+      const formData = new FormData();
+      formData.append("receiverId", selectedContact._id);
+      formData.append("lat", String(latitude));
+      formData.append("lng", String(longitude));
+      formData.append("label", "Shared location");
+      if (replyingTo?._id) formData.append("replyToId", replyingTo._id);
+
+      await sendMessage(formData);
+      setReplyingTo(null);
+      toast.success("Location shared");
+    } catch (err) {
+      // err.code === 1 is PERMISSION_DENIED, which needs different advice from a timeout.
+      const denied = err?.code === 1;
+      toast.error(
+        denied
+          ? "Location permission denied. Enable it in your device settings."
+          : err?.message || "Could not get your location"
+      );
+    } finally {
+      setSendingLocation(false);
+    }
+  };
 
   // --- Calling (TRTC) ---------------------------------------------------------------------
   // Inert unless the SERVER reports that TRTC is configured. With no credentials the buttons
@@ -523,8 +646,51 @@ const ChatWindow = () => {
                         </a>
                       )}
 
-                      {/* Media Image / Video Attachment (file cards render above instead) */}
-                      {msg.imageOrVideoUrl && msg.contentType !== "file" && (
+                      {/* Voice note. The native player keeps playback controls and scrubbing off
+                          our own implementation. */}
+                      {msg.contentType === "audio" && msg.imageOrVideoUrl && (
+                        <div className="mb-1.5 flex items-center gap-2">
+                          <audio
+                            controls
+                            preload="metadata"
+                            src={msg.imageOrVideoUrl}
+                            className="h-9 max-w-[220px]"
+                          />
+                          {msg.fileMeta?.duration ? (
+                            <span className="text-[11px] text-[#8696a0]">
+                              {msg.fileMeta.duration}s
+                            </span>
+                          ) : null}
+                        </div>
+                      )}
+
+                      {/* Shared location. A link out to Maps rather than an embedded map, which
+                          would need a third-party API key. */}
+                      {msg.contentType === "location" && msg.location && (
+                        <a
+                          href={`https://www.google.com/maps?q=${msg.location.lat},${msg.location.lng}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="mb-1.5 block rounded-md border border-black/10 dark:border-white/10 overflow-hidden hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+                        >
+                          <span className="flex items-center gap-2.5 px-2.5 py-2 bg-black/5 dark:bg-black/20">
+                            <FaMapMarkerAlt className="w-5 h-5 shrink-0 text-[#00a884]" />
+                            <span className="min-w-0">
+                              <span className="block text-[12.5px] text-[#111b21] dark:text-[#e9edef]">
+                                {msg.location.label || "Shared location"}
+                              </span>
+                              <span className="block text-[11px] text-[#8696a0]">
+                                {msg.location.lat.toFixed(5)}, {msg.location.lng.toFixed(5)} · open in Maps
+                              </span>
+                            </span>
+                          </span>
+                        </a>
+                      )}
+
+                      {/* Media Image / Video Attachment (file cards, voice notes and locations
+                          render above instead). Exclusion list rather than an allowlist so older
+                          messages with no contentType still render as images. */}
+                      {msg.imageOrVideoUrl && !["file", "audio", "location"].includes(msg.contentType) && (
                         <div className="mb-1.5 overflow-hidden rounded-md">
                           {msg.contentType === "video" ? (
                             <video
@@ -719,6 +885,17 @@ const ChatWindow = () => {
             </div>
             <span>Document</span>
           </button>
+          <button
+            type="button"
+            onClick={handleShareLocation}
+            disabled={sendingLocation}
+            className="w-full flex items-center gap-3 px-3 py-2 text-xs font-medium rounded-lg hover:bg-[#f0f2f5] dark:hover:bg-[#182229] text-[#111b21] dark:text-[#e9edef] transition-colors disabled:opacity-50"
+          >
+            <div className="w-7 h-7 rounded-full bg-emerald-500 text-white flex items-center justify-center">
+              <FaMapMarkerAlt className="w-3.5 h-3.5" />
+            </div>
+            <span>{sendingLocation ? "Getting location…" : "Location"}</span>
+          </button>
         </div>
       )}
 
@@ -730,6 +907,38 @@ const ChatWindow = () => {
         onChange={handleFileChange}
         className="hidden"
       />
+
+      {/* Recording strip. Takes over the composer's role while a voice note is being captured. */}
+      {recording && (
+        <div className="px-3 py-2.5 bg-[#f0f2f5] dark:bg-[#202c33] border-t border-[#e9edef] dark:border-[#222e35] flex items-center gap-3 z-20">
+          <button
+            type="button"
+            onClick={handleCancelRecording}
+            className="p-2 rounded-full text-[#8696a0] hover:text-red-500 hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
+            title="Discard recording"
+          >
+            <FaTimes className="w-4 h-4" />
+          </button>
+
+          <span className="flex items-center gap-2 text-sm font-medium text-red-500 tabular-nums">
+            <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse" />
+            {String(Math.floor(recordSeconds / 60)).padStart(2, "0")}:
+            {String(recordSeconds % 60).padStart(2, "0")}
+          </span>
+
+          <span className="flex-1 text-xs text-[#8696a0]">Recording…</span>
+
+          <button
+            type="button"
+            onClick={handleSendRecording}
+            disabled={sendingVoice}
+            className="p-2.5 rounded-full bg-[#00a884] hover:bg-[#02906f] text-white shadow-md transition-all disabled:opacity-50"
+            title="Send voice message"
+          >
+            <FaPaperPlane className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Reply preview — shown while composing a reply. */}
       {replyingTo && (
@@ -876,8 +1085,10 @@ const ChatWindow = () => {
         ) : (
           <button
             type="button"
-            className="p-2 text-[#54656f] dark:text-[#8696a0] hover:text-[#00a884] transition-colors"
-            title="Voice message"
+            onClick={handleStartRecording}
+            disabled={recording || sendingVoice}
+            className="p-2 text-[#54656f] dark:text-[#8696a0] hover:text-[#00a884] transition-colors disabled:opacity-50"
+            title="Record a voice message"
           >
             <FaMicrophone className="w-5 h-5" />
           </button>

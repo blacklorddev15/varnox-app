@@ -27,7 +27,7 @@ const messageSchema = new mongoose.Schema(
         type: String,
         // "file" covers any non-media attachment (pdf, docx, zip, …) and is rendered as a file
         // card rather than a preview.
-        enum: ["text", "image", "video", "file"],
+        enum: ["text", "image", "video", "file", "audio", "location"],
     },
     // Original name/size/type of an attachment. Without this a file card would only be able to
     // show a Cloudinary URL, which tells the recipient nothing.
@@ -35,6 +35,15 @@ const messageSchema = new mongoose.Schema(
       name: { type: String },
       size: { type: Number },
       mimeType: { type: String },
+      // Audio only, in seconds — lets a voice note show its duration without downloading it.
+      duration: { type: Number },
+    },
+    // Shared location. Stored as numbers rather than a string so the client can build a map link
+    // and the values stay machine-readable.
+    location: {
+      lat: { type: Number },
+      lng: { type: Number },
+      label: { type: String },
     },
     // Quote / reply. Refers to another Message; may dangle if that message is later deleted,
     // so the UI has to tolerate a null populate.

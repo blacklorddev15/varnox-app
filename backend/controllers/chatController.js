@@ -5,7 +5,22 @@ const response = require("../utils/responseHandler");
 
 exports.sendMessage = async (req, res) => {
   try {
-    const { senderId, receiverId, content, messageStatus, replyToId, isForwarded } = req.body;
+    const {
+      senderId,
+      receiverId,
+      content,
+      messageStatus,
+      replyToId,
+      isForwarded,
+      // Voice notes: MediaRecorder reports audio-only recordings as video/webm in most browsers,
+      // so the client sends this hint. Without it a voice note would be filed as a video.
+      messageType,
+      duration,
+      // Shared location
+      lat,
+      lng,
+      label,
+    } = req.body;
     const effectiveSenderId = senderId || req.user?._id;
     const file = req.file;
 
@@ -37,23 +52,55 @@ exports.sendMessage = async (req, res) => {
       }
       imageOrVideoUrl = uploadResult.secure_url;
 
+      const wantsAudio = messageType === "audio";
+
       if (file.mimetype?.startsWith("image/")) {
         contentType = "image";
+      } else if (file.mimetype?.startsWith("audio/")) {
+        contentType = "audio";
       } else if (file.mimetype?.startsWith("video/")) {
-        contentType = "video";
+        contentType = wantsAudio ? "audio" : "video";
       } else {
         // Anything else is accepted as a generic attachment and shown as a file card. The old
         // code rejected every non image/video type outright.
         contentType = "file";
       }
 
+      const durationNum = Number(duration);
+
       fileMeta = {
         name: file.originalname || null,
         size: file.size || null,
         mimeType: file.mimetype || null,
+        duration: Number.isFinite(durationNum) && durationNum > 0 ? Math.round(durationNum) : undefined,
       };
-    } else if (!content?.trim()) {
+    } else if (!content?.trim() && !(lat !== undefined && lng !== undefined)) {
+      // Coordinates count as content: a location message legitimately carries no text and no file.
       return response(res, 400, "Message content or file is required");
+    }
+
+    // Shared location. Validated here rather than trusted, since coordinates come straight from
+    // the client and out-of-range values would break any map the recipient renders.
+    let location;
+    if (contentType === "text" && !file && lat !== undefined && lng !== undefined) {
+      const latNum = Number(lat);
+      const lngNum = Number(lng);
+
+      if (
+        !Number.isFinite(latNum) ||
+        !Number.isFinite(lngNum) ||
+        Math.abs(latNum) > 90 ||
+        Math.abs(lngNum) > 180
+      ) {
+        return response(res, 400, "Invalid location coordinates");
+      }
+
+      contentType = "location";
+      location = {
+        lat: latNum,
+        lng: lngNum,
+        label: label ? String(label).slice(0, 120) : null,
+      };
     }
 
     // A reply must point at a message in THIS conversation. Without that check a crafted request
@@ -79,6 +126,7 @@ exports.sendMessage = async (req, res) => {
       contentType: contentType,
       imageOrVideoUrl: imageOrVideoUrl,
       fileMeta,
+      location,
       replyTo,
       isForwarded: isForwarded === true || isForwarded === "true",
       messageStatus: messageStatus || "sent",
@@ -96,7 +144,7 @@ exports.sendMessage = async (req, res) => {
       // populates to null, which the UI has to tolerate.
       .populate({
         path: "replyTo",
-        select: "content contentType imageOrVideoUrl fileMeta sender",
+        select: "content contentType imageOrVideoUrl fileMeta location sender",
         populate: { path: "sender", select: "username" },
       });
 
@@ -157,7 +205,7 @@ exports.getMessages = async (req, res) => {
       .populate("reactions.user", "username profilePicture")
       .populate({
         path: "replyTo",
-        select: "content contentType imageOrVideoUrl fileMeta sender",
+        select: "content contentType imageOrVideoUrl fileMeta location sender",
         populate: { path: "sender", select: "username" },
       })
       .sort({ createdAt: 1 });

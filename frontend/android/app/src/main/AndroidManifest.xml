@@ -47,6 +47,13 @@
     <!-- Android 12+ needs this to route call audio to a Bluetooth headset. -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
+    <!-- Location sharing. COARSE is enough for a neighbourhood-level pin and is what the user is
+         asked for; FINE is requested when they choose precise sharing. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-feature android:name="android.hardware.location" android:required="false" />
+    <uses-feature android:name="android.hardware.location.gps" android:required="false" />
+
     <!-- Declared but not required, so the app still installs on devices without a camera. -->
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
